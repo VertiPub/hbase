@@ -84,7 +84,8 @@ for x in "$@" ; do
 done
 
 # quick function to get a value from the HBase config file
-distMode=`$bin/hbase org.apache.hadoop.hbase.util.HBaseConfTool hbase.cluster.distributed`
+# HBASE-6504 - only take the first line of the output in case verbose gc is on
+distMode=`$bin/hbase org.apache.hadoop.hbase.util.HBaseConfTool hbase.cluster.distributed | head -n 1`
 if [ "$distMode" == 'false' ]; then
   if [ $RR_RS -ne 1 ] || [ $RR_MASTER -ne 1 ]; then
     echo Cant do selective rolling restart if not running distributed
@@ -106,7 +107,7 @@ else
     if [ "$zmaster" == "null" ]; then zmaster="master"; fi
     zmaster=$zparent/$zmaster
     echo -n "Waiting for Master ZNode ${zmaster} to expire"
-    while ! bin/hbase zkcli stat $zmaster 2>&1 | grep "Node does not exist"; do
+    while ! "$bin"/hbase zkcli stat $zmaster 2>&1 | grep "Node does not exist"; do
       echo -n "."
       sleep 1
     done

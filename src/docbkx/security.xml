@@ -26,16 +26,14 @@
  * limitations under the License.
  */
 -->
-<title>Secure HBase</title>
+<title>Secure Apache HBase (TM)</title>
 <section xml:id="hbase.secure.configuration">
-    <title>Secure Client Access to HBase</title>
-    <para>Newer releases of HBase (&gt;= 0.92) support optional SASL authentication of clients.</para>
-    <para>This describes how to set up HBase and HBase clients for connection to secure HBase resources. </para>
+    <title>Secure Client Access to Apache HBase</title>
+    <para>Newer releases of Apache HBase (TM) (&gt;= 0.92) support optional SASL authentication of clients<footnote><para>See
+    also Matteo Bertozzi's article on <link xlink:href="http://www.cloudera.com/blog/2012/09/understanding-user-authentication-and-authorization-in-apache-hbase/">Understanding User Authentication and Authorization in Apache HBase</link>.</para></footnote>.</para>
+    <para>This describes how to set up Apache HBase and clients for connection to secure HBase resources.</para>
 
     <section><title>Prerequisites</title>
-    <para>
-       HBase must have been built using the new maven profile for secure Hadoop/HBase: <code>-P security</code>. Secure Hadoop dependent classes are separated under a pseudo-module in the security/ directory and are only included if built with the secure Hadoop profile. 
-    </para>
     <para>
         You need to have a working Kerberos KDC.
     </para>
@@ -116,10 +114,6 @@
         <value>true</value>
       </property>
       <property>
-        <name>hbase.rpc.engine</name>
-        <value>org.apache.hadoop.hbase.ipc.SecureRpcEngine</value>
-      </property>
-      <property>
       <name>hbase.coprocessor.region.classes</name>
         <value>org.apache.hadoop.hbase.security.token.TokenProvider</value>
       </property>
@@ -139,10 +133,6 @@
         <name>hbase.security.authentication</name>
         <value>kerberos</value>
       </property> 
-      <property>
-        <name>hbase.rpc.engine</name>
-        <value>org.apache.hadoop.hbase.ipc.SecureRpcEngine</value>
-      </property>
     ]]></programlisting>
     <para>
         The client environment must be logged in to Kerberos from KDC or
@@ -151,9 +141,8 @@
     </para>
     <para>
         Be advised that if the <code>hbase.security.authentication</code>
-        and <code>hbase.rpc.engine</code> properties in the client- and
-        server-side site files do not match, the client will not be able to
-        communicate with the cluster.
+        in the client- and server-side site files do not match, the client will 
+        not be able to communicate with the cluster.
     </para>
     <para>
         Once HBase is configured for secure RPC it is possible to optionally
@@ -244,7 +233,7 @@
 <section xml:id="hbase.accesscontrol.configuration">
     <title>Access Control</title>
     <para>
-        Newer releases of HBase (&gt;= 0.92) support optional access control
+        Newer releases of Apache HBase (&gt;= 0.92) support optional access control
         list (ACL-) based protection of resources on a column family and/or
         table basis.
     </para>

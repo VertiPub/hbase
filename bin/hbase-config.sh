@@ -75,19 +75,50 @@ HBASE_CONF_DIR="${HBASE_CONF_DIR:-$HBASE_HOME/conf}"
 HBASE_REGIONSERVERS="${HBASE_REGIONSERVERS:-$HBASE_CONF_DIR/regionservers}"
 # List of hbase secondary masters.
 HBASE_BACKUP_MASTERS="${HBASE_BACKUP_MASTERS:-$HBASE_CONF_DIR/backup-masters}"
-# Thrift jmx opts
-if [ -z "$HBASE_THRIFT_JMX_OPTS" ]; then
-  HBASE_THRIFT_JMX_OPTS="$HBASE_JMX_OPTS -Dcom.sun.management.jmxremote.port=8093"
+# Thrift JMX opts
+if [[ -n "$HBASE_JMX_OPTS" && -z "$HBASE_THRIFT_JMX_OPTS" ]]; then
+  HBASE_THRIFT_JMX_OPTS="$HBASE_JMX_OPTS -Dcom.sun.management.jmxremote.port=10103"
 fi
 # Thrift opts
 if [ -z "$HBASE_THRIFT_OPTS" ]; then
   export HBASE_THRIFT_OPTS="$HBASE_THRIFT_JMX_OPTS"
 fi
 
+# REST JMX opts
+if [[ -n "$HBASE_JMX_OPTS" && -z "$HBASE_REST_JMX_OPTS" ]]; then
+  HBASE_REST_JMX_OPTS="$HBASE_JMX_OPTS -Dcom.sun.management.jmxremote.port=10105"
+fi
+# REST opts
+if [ -z "$HBASE_REST_OPTS" ]; then
+  export HBASE_REST_OPTS="$HBASE_REST_JMX_OPTS"
+fi
+
 # Source the hbase-env.sh.  Will have JAVA_HOME defined.
 if [ -f "${HBASE_CONF_DIR}/hbase-env.sh" ]; then
   . "${HBASE_CONF_DIR}/hbase-env.sh"
 fi
+
+# Set default value for regionserver uid if not present
+if [ -z "$HBASE_REGIONSERVER_UID" ]; then
+  HBASE_REGIONSERVER_UID="hbase"
+fi
+
+# Verify if hbase has the mlock agent
+if [ "$HBASE_REGIONSERVER_MLOCK" = "true" ]; then
+  MLOCK_AGENT="$HBASE_HOME/native/libmlockall_agent.so"
+  if [ ! -f "$MLOCK_AGENT" ]; then
+    cat 1>&2 <<EOF
+Unable to find mlockall_agent, hbase must be compiled with -Pnative
+EOF
+    exit 1
+  fi
+
+  HBASE_REGIONSERVER_OPTS="$HBASE_REGIONSERVER_OPTS -agentpath:$MLOCK_AGENT=user=$HBASE_REGIONSERVER_UID"
+fi
+
+# Newer versions of glibc use an arena memory allocator that causes virtual
+# memory usage to explode. Tune the variable down to prevent vmem explosion.
+export MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-4}
 
 if [ -z "$JAVA_HOME" ]; then
   for candidate in \
