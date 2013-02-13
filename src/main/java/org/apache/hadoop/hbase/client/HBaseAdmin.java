@@ -22,12 +22,14 @@ package org.apache.hadoop.hbase.client;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.lang.reflect.Proxy;
 import java.lang.reflect.UndeclaredThrowableException;
 import java.net.SocketTimeoutException;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 
 import org.apache.commons.logging.Log;
@@ -47,19 +49,23 @@ import org.apache.hadoop.hbase.RegionException;
 import org.apache.hadoop.hbase.RemoteExceptionHandler;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableExistsException;
+import org.apache.hadoop.hbase.TableNotEnabledException;
 import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.UnknownRegionException;
 import org.apache.hadoop.hbase.ZooKeeperConnectionException;
 import org.apache.hadoop.hbase.catalog.CatalogTracker;
 import org.apache.hadoop.hbase.catalog.MetaReader;
 import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
+import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitorBase;
+import org.apache.hadoop.hbase.ipc.CoprocessorProtocol;
 import org.apache.hadoop.hbase.ipc.HMasterInterface;
 import org.apache.hadoop.hbase.ipc.HRegionInterface;
+import org.apache.hadoop.hbase.ipc.MasterExecRPCInvoker;
+import org.apache.hadoop.hbase.regionserver.compactions.CompactionRequest.CompactionState;
 import org.apache.hadoop.hbase.regionserver.wal.FailedLogCloseException;
 import org.apache.hadoop.hbase.util.Addressing;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
-import org.apache.hadoop.hbase.util.Writables;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.util.StringUtils;
 
@@ -84,7 +90,9 @@ public class HBaseAdmin implements Abortable, Closeable {
   // want to wait a long time.
   private final int retryLongerMultiplier;
   private boolean aborted;
-  
+
+  private static volatile boolean synchronousBalanceSwitchSupported = true;
+
   /**
    * Constructor
    *
@@ -397,57 +405,75 @@ public class HBaseAdmin implements Abortable, Closeable {
     }
     int numRegs = splitKeys == null ? 1 : splitKeys.length + 1;
     int prevRegCount = 0;
+    boolean doneWithMetaScan = false;
     for (int tries = 0; tries < this.numRetries * this.retryLongerMultiplier;
       ++tries) {
-      // Wait for new table to come on-line
-      final AtomicInteger actualRegCount = new AtomicInteger(0);
-      MetaScannerVisitor visitor = new MetaScannerVisitor() {
-        @Override
-        public boolean processRow(Result rowResult) throws IOException {
-          HRegionInfo info = Writables.getHRegionInfoOrNull(
-              rowResult.getValue(HConstants.CATALOG_FAMILY,
-                  HConstants.REGIONINFO_QUALIFIER));
-          //If regioninfo is null, skip this row
-          if (null == info) {
+      if (!doneWithMetaScan) {
+        // Wait for new table to come on-line
+        final AtomicInteger actualRegCount = new AtomicInteger(0);
+        MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
+          @Override
+          public boolean processRow(Result rowResult) throws IOException {
+            if (rowResult == null || rowResult.size() <= 0) {
+              return true;
+            }
+            HRegionInfo info = MetaReader.parseHRegionInfoFromCatalogResult(
+              rowResult, HConstants.REGIONINFO_QUALIFIER);
+            if (info == null) {
+              LOG.warn("No serialized HRegionInfo in " + rowResult);
+              return true;
+            }
+            if (!(Bytes.equals(info.getTableName(), desc.getName()))) {
+              return false;
+            }
+            String hostAndPort = null;
+            byte [] value = rowResult.getValue(HConstants.CATALOG_FAMILY,
+              HConstants.SERVER_QUALIFIER);
+            // Make sure that regions are assigned to server
+            if (value != null && value.length > 0) {
+              hostAndPort = Bytes.toString(value);
+            }
+            if (!(info.isOffline() || info.isSplit()) && hostAndPort != null) {
+              actualRegCount.incrementAndGet();
+            }
             return true;
           }
-          if (!(Bytes.equals(info.getTableName(), desc.getName()))) {
-            return false;
+        };
+        MetaScanner.metaScan(conf, visitor, desc.getName());
+        if (actualRegCount.get() != numRegs) {
+          if (tries == this.numRetries * this.retryLongerMultiplier - 1) {
+            throw new RegionOfflineException("Only " + actualRegCount.get() +
+              " of " + numRegs + " regions are online; retries exhausted.");
           }
-          String hostAndPort = null;
-          byte [] value = rowResult.getValue(HConstants.CATALOG_FAMILY,
-              HConstants.SERVER_QUALIFIER);
-          // Make sure that regions are assigned to server
-          if (value != null && value.length > 0) {
-            hostAndPort = Bytes.toString(value);
+          try { // Sleep
+            Thread.sleep(getPauseTime(tries));
+          } catch (InterruptedException e) {
+            throw new InterruptedIOException("Interrupted when opening" +
+              " regions; " + actualRegCount.get() + " of " + numRegs +
+              " regions processed so far");
           }
-          if (!(info.isOffline() || info.isSplit()) && hostAndPort != null) {
-            actualRegCount.incrementAndGet();
+          if (actualRegCount.get() > prevRegCount) { // Making progress
+            prevRegCount = actualRegCount.get();
+            tries = -1;
           }
-          return true;
+        } else {
+          doneWithMetaScan = true;
+          tries = -1;
         }
-      };
-      MetaScanner.metaScan(conf, visitor, desc.getName());
-      if (actualRegCount.get() != numRegs) {
-        if (tries == this.numRetries * this.retryLongerMultiplier - 1) {
-          throw new RegionOfflineException("Only " + actualRegCount.get() +
-            " of " + numRegs + " regions are online; retries exhausted.");
-        }
+      } else if (isTableEnabled(desc.getName())) {
+        return;
+      } else {
         try { // Sleep
           Thread.sleep(getPauseTime(tries));
         } catch (InterruptedException e) {
-          throw new InterruptedIOException("Interrupted when opening" +
-              " regions; " + actualRegCount.get() + " of " + numRegs + 
-              " regions processed so far");
+          throw new InterruptedIOException("Interrupted when waiting" +
+            " for table to be enabled; meta scan was done");
         }
-        if (actualRegCount.get() > prevRegCount) { // Making progress
-          prevRegCount = actualRegCount.get();
-          tries = -1;
-        }
-      } else {
-        return;
       }
     }
+    throw new TableNotEnabledException(
+      "Retries exhausted while still waiting for table: "
+      + desc.getNameAsString() + " to be enabled");
   }
 
   /**
@@ -694,6 +720,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void enableTableAsync(final byte [] tableName)
   throws IOException {
+    HTableDescriptor.isLegalTableName(tableName);
     isMasterRunning();
     try {
       getMaster().enableTable(tableName);
@@ -762,6 +789,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @since 0.90.0
    */
   public void disableTableAsync(final byte [] tableName) throws IOException {
+    HTableDescriptor.isLegalTableName(tableName);
     isMasterRunning();
     try {
       getMaster().disableTable(tableName);
@@ -875,7 +903,9 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public boolean isTableEnabled(byte[] tableName) throws IOException {
-    HTableDescriptor.isLegalTableName(tableName);
+    if (!HTableDescriptor.isMetaTable(tableName)) {
+      HTableDescriptor.isLegalTableName(tableName);
+    }
     return connection.isTableEnabled(tableName);
   }
 
@@ -894,7 +924,9 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public boolean isTableDisabled(byte[] tableName) throws IOException {
-    HTableDescriptor.isLegalTableName(tableName);
+    if (!HTableDescriptor.isMetaTable(tableName)) {
+      HTableDescriptor.isLegalTableName(tableName);
+    }
     return connection.isTableDisabled(tableName);
   }
 
@@ -1062,16 +1094,16 @@ public class HBaseAdmin implements Abortable, Closeable {
       if (serverName != null) {
         Pair<HRegionInfo, ServerName> pair = MetaReader.getRegion(ct, regionname);
         if (pair == null || pair.getFirst() == null) {
-          LOG.info("No region in .META. for " +
-            Bytes.toStringBinary(regionname) + "; pair=" + pair);
+          throw new UnknownRegionException(Bytes.toStringBinary(regionname));
         } else {
           closeRegion(new ServerName(serverName), pair.getFirst());
         }
       } else {
         Pair<HRegionInfo, ServerName> pair = MetaReader.getRegion(ct, regionname);
-        if (pair == null || pair.getSecond() == null) {
-          LOG.info("No server in .META. for " +
-            Bytes.toStringBinary(regionname) + "; pair=" + pair);
+        if (pair == null) {
+          throw new UnknownRegionException(Bytes.toStringBinary(regionname));
+        } else if (pair.getSecond() == null) {
+          throw new NoServerForRegionException(Bytes.toStringBinary(regionname));
         } else {
           closeRegion(pair.getSecond(), pair.getFirst());
         }
@@ -1159,16 +1191,14 @@ public class HBaseAdmin implements Abortable, Closeable {
   public void flush(final byte [] tableNameOrRegionName)
   throws IOException, InterruptedException {
     CatalogTracker ct = getCatalogTracker();
-    boolean isRegionName = isRegionName(tableNameOrRegionName, ct);
     try {
-      if (isRegionName) {
-        Pair<HRegionInfo, ServerName> pair =
-          MetaReader.getRegion(ct, tableNameOrRegionName);
-        if (pair == null || pair.getSecond() == null) {
-          LOG.info("No server in .META. for " +
-            Bytes.toStringBinary(tableNameOrRegionName) + "; pair=" + pair);
+      Pair<HRegionInfo, ServerName> regionServerPair
+        = getRegion(tableNameOrRegionName, ct);
+      if (regionServerPair != null) {
+        if (regionServerPair.getSecond() == null) {
+          throw new NoServerForRegionException(Bytes.toStringBinary(tableNameOrRegionName));
         } else {
-          flush(pair.getSecond(), pair.getFirst());
+          flush(regionServerPair.getSecond(), regionServerPair.getFirst());
         }
       } else {
         final String tableName = tableNameString(tableNameOrRegionName, ct);
@@ -1223,7 +1253,35 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void compact(final byte [] tableNameOrRegionName)
   throws IOException, InterruptedException {
-    compact(tableNameOrRegionName, false);
+    compact(tableNameOrRegionName, null, false);
+  }
+  
+  /**
+   * Compact a column family within a table or region.
+   * Asynchronous operation.
+   *
+   * @param tableOrRegionName table or region to compact
+   * @param columnFamily column family within a table or region
+   * @throws IOException if a remote or network exception occurs
+   * @throws InterruptedException
+   */
+  public void compact(String tableOrRegionName, String columnFamily)
+    throws IOException,  InterruptedException {
+    compact(Bytes.toBytes(tableOrRegionName), Bytes.toBytes(columnFamily));
+  }
+
+  /**
+   * Compact a column family within a table or region.
+   * Asynchronous operation.
+   *
+   * @param tableNameOrRegionName table or region to compact
+   * @param columnFamily column family within a table or region
+   * @throws IOException if a remote or network exception occurs
+   * @throws InterruptedException
+   */
+  public void compact(final byte [] tableNameOrRegionName, final byte[] columnFamily)
+  throws IOException, InterruptedException {
+    compact(tableNameOrRegionName, columnFamily, false);
   }
 
   /**
@@ -1249,7 +1307,36 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void majorCompact(final byte [] tableNameOrRegionName)
   throws IOException, InterruptedException {
-    compact(tableNameOrRegionName, true);
+    compact(tableNameOrRegionName, null, true);
+  }
+  
+  /**
+   * Major compact a column family within a table or region.
+   * Asynchronous operation.
+   *
+   * @param tableNameOrRegionName table or region to major compact
+   * @param columnFamily column family within a table or region
+   * @throws IOException if a remote or network exception occurs
+   * @throws InterruptedException
+   */
+  public void majorCompact(final String tableNameOrRegionName,
+    final String columnFamily) throws IOException, InterruptedException {
+    majorCompact(Bytes.toBytes(tableNameOrRegionName),
+      Bytes.toBytes(columnFamily));
+  }
+
+  /**
+   * Major compact a column family within a table or region.
+   * Asynchronous operation.
+   *
+   * @param tableNameOrRegionName table or region to major compact
+   * @param columnFamily column family within a table or region
+   * @throws IOException if a remote or network exception occurs
+   * @throws InterruptedException
+   */
+  public void majorCompact(final byte [] tableNameOrRegionName,
+    final byte[] columnFamily) throws IOException, InterruptedException {
+    compact(tableNameOrRegionName, columnFamily, true);
   }
 
   /**
@@ -1257,22 +1344,23 @@ public class HBaseAdmin implements Abortable, Closeable {
    * Asynchronous operation.
    *
    * @param tableNameOrRegionName table or region to compact
+   * @param columnFamily column family within a table or region
    * @param major True if we are to do a major compaction.
    * @throws IOException if a remote or network exception occurs
    * @throws InterruptedException
    */
-  private void compact(final byte [] tableNameOrRegionName, final boolean major)
+  private void compact(final byte [] tableNameOrRegionName,
+    final byte[] columnFamily, final boolean major)
   throws IOException, InterruptedException {
     CatalogTracker ct = getCatalogTracker();
     try {
-      if (isRegionName(tableNameOrRegionName, ct)) {
-        Pair<HRegionInfo, ServerName> pair =
-          MetaReader.getRegion(ct, tableNameOrRegionName);
-        if (pair == null || pair.getSecond() == null) {
-          LOG.info("No server in .META. for " +
-            Bytes.toStringBinary(tableNameOrRegionName) + "; pair=" + pair);
+      Pair<HRegionInfo, ServerName> regionServerPair
+        = getRegion(tableNameOrRegionName, ct);
+      if (regionServerPair != null) {
+        if (regionServerPair.getSecond() == null) {
+          throw new NoServerForRegionException(Bytes.toStringBinary(tableNameOrRegionName));
         } else {
-          compact(pair.getSecond(), pair.getFirst(), major);
+          compact(regionServerPair.getSecond(), regionServerPair.getFirst(), major, columnFamily);
         }
       } else {
         final String tableName = tableNameString(tableNameOrRegionName, ct);
@@ -1283,7 +1371,7 @@ public class HBaseAdmin implements Abortable, Closeable {
           if (pair.getFirst().isOffline()) continue;
           if (pair.getSecond() == null) continue;
           try {
-            compact(pair.getSecond(), pair.getFirst(), major);
+            compact(pair.getSecond(), pair.getFirst(), major, columnFamily);
           } catch (NotServingRegionException e) {
             if (LOG.isDebugEnabled()) {
               LOG.debug("Trying to" + (major ? " major" : "") + " compact " +
@@ -1299,11 +1387,26 @@ public class HBaseAdmin implements Abortable, Closeable {
   }
 
   private void compact(final ServerName sn, final HRegionInfo hri,
-      final boolean major)
+      final boolean major, final byte [] family)
   throws IOException {
     HRegionInterface rs =
       this.connection.getHRegionConnection(sn.getHostname(), sn.getPort());
-    rs.compactRegion(hri, major);
+    if (family != null) {
+      try {
+        rs.compactRegion(hri, major, family);
+      } catch (IOException ioe) {
+        String notFoundMsg = "java.lang.NoSuchMethodException: org.apache.hadoop.hbase.ipc.HRegionInterface."
+          + "compactRegion(org.apache.hadoop.hbase.HRegionInfo, boolean, [B)";
+        if (ioe.getMessage().contains(notFoundMsg)) {
+          throw new IOException("per-column family compaction not supported on this version "
+            + "of the HBase server.  You may still compact at the table or region level by "
+          	+ "omitting the column family name.  Alternatively, you can upgrade the HBase server");
+        }
+        throw ioe;
+      }
+    } else {
+      rs.compactRegion(hri, major);
+    }
   }
 
   /**
@@ -1361,10 +1464,37 @@ public class HBaseAdmin implements Abortable, Closeable {
    * Turn the load balancer on or off.
    * @param b If true, enable balancer. If false, disable balancer.
    * @return Previous balancer value
+   * @deprecated use setBalancerRunning(boolean, boolean) instead
    */
+  @Deprecated
   public boolean balanceSwitch(final boolean b)
   throws MasterNotRunningException, ZooKeeperConnectionException {
     return getMaster().balanceSwitch(b);
+  }
+
+  /**
+   * Turn the load balancer on or off.
+   * @param on If true, enable balancer. If false, disable balancer.
+   * @param synchronous If true, it waits until current balance() call, if outstanding, to return.
+   * @return Previous balancer value
+   */
+  public boolean setBalancerRunning(final boolean on, final boolean synchronous)
+  throws MasterNotRunningException, ZooKeeperConnectionException {
+    if (synchronous && synchronousBalanceSwitchSupported) {
+      try {
+        return getMaster().synchronousBalanceSwitch(on);
+      } catch (UndeclaredThrowableException ute) {
+        String error = ute.getCause().getMessage();
+        if (error != null && error.matches(
+            "(?s).+NoSuchMethodException:.+synchronousBalanceSwitch.+")) {
+          LOG.info("HMaster doesn't support synchronousBalanceSwitch");
+          synchronousBalanceSwitchSupported = false;
+        } else {
+          throw ute;
+        }
+      }
+    }
+    return balanceSwitch(on);
   }
 
   /**
@@ -1422,15 +1552,13 @@ public class HBaseAdmin implements Abortable, Closeable {
       final byte [] splitPoint) throws IOException, InterruptedException {
     CatalogTracker ct = getCatalogTracker();
     try {
-      if (isRegionName(tableNameOrRegionName, ct)) {
-        // Its a possible region name.
-        Pair<HRegionInfo, ServerName> pair =
-          MetaReader.getRegion(ct, tableNameOrRegionName);
-        if (pair == null || pair.getSecond() == null) {
-          LOG.info("No server in .META. for " +
-            Bytes.toStringBinary(tableNameOrRegionName) + "; pair=" + pair);
+      Pair<HRegionInfo, ServerName> regionServerPair
+        = getRegion(tableNameOrRegionName, ct);
+      if (regionServerPair != null) {
+        if (regionServerPair.getSecond() == null) {
+            throw new NoServerForRegionException(Bytes.toStringBinary(tableNameOrRegionName));
         } else {
-          split(pair.getSecond(), pair.getFirst(), splitPoint);
+          split(regionServerPair.getSecond(), regionServerPair.getFirst(), splitPoint);
         }
       } else {
         final String tableName = tableNameString(tableNameOrRegionName, ct);
@@ -1484,20 +1612,46 @@ public class HBaseAdmin implements Abortable, Closeable {
 
   /**
    * @param tableNameOrRegionName Name of a table or name of a region.
-   * @param ct A {@link #CatalogTracker} instance (caller of this method usually has one).
-   * @return True if <code>tableNameOrRegionName</code> is a verified region
-   * name (we call {@link #MetaReader.getRegion(CatalogTracker catalogTracker,
-   * byte [] regionName)};) else false.
+   * @param ct A {@link CatalogTracker} instance (caller of this method usually has one).
+   * @return a pair of HRegionInfo and ServerName if <code>tableNameOrRegionName</code> is
+   *  a verified region name (we call {@link  MetaReader#getRegion( CatalogTracker, byte[])}
+   *  else null.
    * Throw an exception if <code>tableNameOrRegionName</code> is null.
    * @throws IOException
    */
-  private boolean isRegionName(final byte[] tableNameOrRegionName,
-      CatalogTracker ct)
-  throws IOException {
+  Pair<HRegionInfo, ServerName> getRegion(final byte[] tableNameOrRegionName,
+      final CatalogTracker ct) throws IOException {
     if (tableNameOrRegionName == null) {
       throw new IllegalArgumentException("Pass a table name or region name");
     }
-    return (MetaReader.getRegion(ct, tableNameOrRegionName) != null);
+    Pair<HRegionInfo, ServerName> pair = MetaReader.getRegion(ct, tableNameOrRegionName);
+    if (pair == null) {
+      final AtomicReference<Pair<HRegionInfo, ServerName>> result =
+        new AtomicReference<Pair<HRegionInfo, ServerName>>(null);
+      final String encodedName = Bytes.toString(tableNameOrRegionName);
+      MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
+        @Override
+        public boolean processRow(Result data) throws IOException {
+          if (data == null || data.size() <= 0) {
+            return true;
+          }
+          HRegionInfo info = MetaReader.parseHRegionInfoFromCatalogResult(
+            data, HConstants.REGIONINFO_QUALIFIER);
+          if (info == null) {
+            LOG.warn("No serialized HRegionInfo in " + data);
+            return true;
+          }
+          if (!encodedName.equals(info.getEncodedName())) return true;
+          ServerName sn = MetaReader.getServerNameFromCatalogResult(data);
+          result.set(new Pair<HRegionInfo, ServerName>(info, sn));
+          return false; // found the region, stop
+        }
+      };
+
+      MetaScanner.metaScan(conf, visitor);
+      pair = result.get();
+    }
+    return pair;
   }
 
   /**
@@ -1665,5 +1819,106 @@ public class HBaseAdmin implements Abortable, Closeable {
       LOG.error("Could not getClusterStatus()",e);
       return null;
     }
+  }
+
+  /**
+   * Get the current compaction state of a table or region.
+   * It could be in a major compaction, a minor compaction, both, or none.
+   *
+   * @param tableNameOrRegionName table or region to major compact
+   * @throws IOException if a remote or network exception occurs
+   * @throws InterruptedException
+   * @return the current compaction state
+   */
+  public CompactionState getCompactionState(final String tableNameOrRegionName)
+      throws IOException, InterruptedException {
+    return getCompactionState(Bytes.toBytes(tableNameOrRegionName));
+  }
+
+  /**
+   * Get the current compaction state of a table or region.
+   * It could be in a major compaction, a minor compaction, both, or none.
+   *
+   * @param tableNameOrRegionName table or region to major compact
+   * @throws IOException if a remote or network exception occurs
+   * @throws InterruptedException
+   * @return the current compaction state
+   */
+  public CompactionState getCompactionState(final byte [] tableNameOrRegionName)
+      throws IOException, InterruptedException {
+    CompactionState state = CompactionState.NONE;
+    CatalogTracker ct = getCatalogTracker();
+    try {
+      Pair<HRegionInfo, ServerName> regionServerPair
+        = getRegion(tableNameOrRegionName, ct);
+      if (regionServerPair != null) {
+        if (regionServerPair.getSecond() == null) {
+          throw new NoServerForRegionException(Bytes.toStringBinary(tableNameOrRegionName));
+        } else {
+          ServerName sn = regionServerPair.getSecond();
+          HRegionInterface rs =
+            this.connection.getHRegionConnection(sn.getHostname(), sn.getPort());
+          return CompactionState.valueOf(
+            rs.getCompactionState(regionServerPair.getFirst().getRegionName()));
+        }
+      } else {
+        final String tableName = tableNameString(tableNameOrRegionName, ct);
+        List<Pair<HRegionInfo, ServerName>> pairs =
+          MetaReader.getTableRegionsAndLocations(ct, tableName);
+        for (Pair<HRegionInfo, ServerName> pair: pairs) {
+          if (pair.getFirst().isOffline()) continue;
+          if (pair.getSecond() == null) continue;
+          try {
+            ServerName sn = pair.getSecond();
+            HRegionInterface rs =
+              this.connection.getHRegionConnection(sn.getHostname(), sn.getPort());
+            switch (CompactionState.valueOf(
+              rs.getCompactionState(pair.getFirst().getRegionName()))) {
+            case MAJOR_AND_MINOR:
+              return CompactionState.MAJOR_AND_MINOR;
+            case MAJOR:
+              if (state == CompactionState.MINOR) {
+                return CompactionState.MAJOR_AND_MINOR;
+              }
+              state = CompactionState.MAJOR;
+              break;
+            case MINOR:
+              if (state == CompactionState.MAJOR) {
+                return CompactionState.MAJOR_AND_MINOR;
+              }
+              state = CompactionState.MINOR;
+              break;
+            case NONE:
+              default: // nothing, continue
+            }
+          } catch (NotServingRegionException e) {
+            if (LOG.isDebugEnabled()) {
+              LOG.debug("Trying to get compaction state of " +
+                pair.getFirst() + ": " +
+                StringUtils.stringifyException(e));
+            }
+          }
+        }
+      }
+    } finally {
+      cleanupCatalogTracker(ct);
+    }
+    return state;
+  }
+
+  /**
+   * Creates and returns a proxy to the CoprocessorProtocol instance running in the
+   * master.
+   *
+   * @param protocol The class or interface defining the remote protocol
+   * @return A CoprocessorProtocol instance
+   */
+  public <T extends CoprocessorProtocol> T coprocessorProxy(
+      Class<T> protocol) {
+    return (T) Proxy.newProxyInstance(this.getClass().getClassLoader(),
+        new Class[]{protocol},
+        new MasterExecRPCInvoker(conf,
+            connection,
+            protocol));
   }
 }

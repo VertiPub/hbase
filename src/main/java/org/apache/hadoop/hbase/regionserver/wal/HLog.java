@@ -41,6 +41,7 @@ import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
@@ -166,6 +167,7 @@ public class HLog implements Syncable {
     Entry next(Entry reuse) throws IOException;
     void seek(long pos) throws IOException;
     long getPosition() throws IOException;
+    void reset() throws IOException;
   }
 
   public interface Writer {
@@ -383,7 +385,7 @@ public class HLog implements Syncable {
   public HLog(final FileSystem fs, final Path dir, final Path oldLogDir,
       final Configuration conf, final List<WALActionsListener> listeners,
       final boolean failIfLogDirExists, final String prefix)
- throws IOException {
+  throws IOException {
     super();
     this.fs = fs;
     this.dir = dir;
@@ -394,7 +396,7 @@ public class HLog implements Syncable {
       }
     }
     this.blocksize = conf.getLong("hbase.regionserver.hlog.blocksize",
-      this.fs.getDefaultBlockSize());
+        getDefaultBlockSize());
     // Roll at 95% of block size.
     float multi = conf.getFloat("hbase.regionserver.logroll.multiplier", 0.95f);
     this.logrollsize = (long)(this.blocksize * multi);
@@ -440,6 +442,33 @@ public class HLog implements Syncable {
     Threads.setDaemonThreadRunning(logSyncerThread.getThread(),
         Thread.currentThread().getName() + ".logSyncer");
     coprocessorHost = new WALCoprocessorHost(this, conf);
+  }
+  
+  // use reflection to search for getDefaultBlockSize(Path f)
+  // if the method doesn't exist, fall back to using getDefaultBlockSize()
+  private long getDefaultBlockSize() throws IOException {
+    Method m = null;
+    Class<? extends FileSystem> cls = this.fs.getClass();
+    try {
+      m = cls.getMethod("getDefaultBlockSize",
+          new Class<?>[] { Path.class });
+    } catch (NoSuchMethodException e) {
+      LOG.info("FileSystem doesn't support getDefaultBlockSize");
+    } catch (SecurityException e) {
+      LOG.info("Doesn't have access to getDefaultBlockSize on "
+          + "FileSystems", e);
+      m = null; // could happen on setAccessible()
+    }
+    if (null == m) {
+      return this.fs.getDefaultBlockSize();
+    } else {
+      try {
+        Object ret = m.invoke(this.fs, this.dir);
+        return ((Long)ret).longValue();
+      } catch (Exception e) {
+        throw new IOException(e);
+      }
+    }
   }
 
   /**
@@ -606,12 +635,6 @@ public class HLog implements Syncable {
       if (nextWriter instanceof SequenceFileLogWriter) {
         nextHdfsOut = ((SequenceFileLogWriter)nextWriter).getWriterFSDataOutputStream();
       }
-      // Tell our listeners that a new log was created
-      if (!this.listeners.isEmpty()) {
-        for (WALActionsListener i : this.listeners) {
-          i.postLogRoll(oldPath, newPath);
-        }
-      }
 
       synchronized (updateLock) {
         // Clean up current writer.
@@ -627,6 +650,13 @@ public class HLog implements Syncable {
           " for " + FSUtils.getPath(newPath));
         this.numEntries.set(0);
       }
+      // Tell our listeners that a new log was created
+      if (!this.listeners.isEmpty()) {
+        for (WALActionsListener i : this.listeners) {
+          i.postLogRoll(oldPath, newPath);
+        }
+      }
+
       // Can we delete any of the old log files?
       if (this.outputfiles.size() > 0) {
         if (this.lastSeqWritten.isEmpty()) {
@@ -666,15 +696,18 @@ public class HLog implements Syncable {
 
   /**
    * Get a reader for the WAL.
+   * The proper way to tail a log that can be under construction is to first use this method
+   * to get a reader then call {@link HLog.Reader#reset()} to see the new data. It will also
+   * take care of keeping implementation-specific context (like compression).
    * @param fs
    * @param path
    * @param conf
    * @return A WAL reader.  Close when done with it.
    * @throws IOException
    */
-  public static Reader getReader(final FileSystem fs,
-    final Path path, Configuration conf)
-  throws IOException {
+  public static Reader getReader(final FileSystem fs, final Path path,
+                                 Configuration conf)
+      throws IOException {
     try {
 
       if (logReaderClass == null) {
@@ -953,7 +986,6 @@ public class HLog implements Syncable {
    */
   public void close() throws IOException {
     try {
-      logSyncerThread.interrupt();
       logSyncerThread.close();
       // Make sure we synced everything
       logSyncerThread.join(this.optionalFlushInterval*2);
@@ -1160,14 +1192,18 @@ public class HLog implements Syncable {
   }
 
   /**
-   * This thread is responsible to call syncFs and buffer up the writers while
-   * it happens.
+   * This class is responsible to hold the HLog's appended Entry list
+   * and to sync them according to a configurable interval.
+   *
+   * Deferred log flushing works first by piggy backing on this process by
+   * simply not sync'ing the appended Entry. It can also be sync'd by other
+   * non-deferred log flushed entries outside of this thread.
    */
-   class LogSyncer extends HasThread {
+  class LogSyncer extends HasThread {
 
     private final long optionalFlushInterval;
-    
-    private boolean closeLogSyncer = false;
+
+    private AtomicBoolean closeLogSyncer = new AtomicBoolean(false);
 
     // List of pending writes to the HLog. There corresponds to transactions
     // that have not yet returned to the client. We keep them cached here
@@ -1186,12 +1222,17 @@ public class HLog implements Syncable {
       try {
         // awaiting with a timeout doesn't always
         // throw exceptions on interrupt
-        while(!this.isInterrupted() && !closeLogSyncer) {
+        while(!this.isInterrupted() && !closeLogSyncer.get()) {
 
           try {
             if (unflushedEntries.get() <= syncedTillHere) {
-              Thread.sleep(this.optionalFlushInterval);
+              synchronized (closeLogSyncer) {
+                closeLogSyncer.wait(this.optionalFlushInterval);
+              }
             }
+            // Calling sync since we waited or had unflushed entries.
+            // Entries appended but not sync'd are taken care of here AKA
+            // deferred log flush
             sync();
           } catch (IOException e) {
             LOG.error("Error while syncing, requesting close of hlog ", e);
@@ -1229,9 +1270,12 @@ public class HLog implements Syncable {
         writer.append(e);
       }
     }
-    
-    void close(){
-      closeLogSyncer = true;
+
+    void close() {
+      synchronized (closeLogSyncer) {
+        closeLogSyncer.set(true);
+        closeLogSyncer.notifyAll();
+      }
     }
   }
 
@@ -1259,16 +1303,24 @@ public class HLog implements Syncable {
       // issue the sync to HDFS. If sync is successful, then update
       // syncedTillHere to indicate that transactions till this
       // number has been successfully synced.
+      IOException ioe = null;
+      List<Entry> pending = null;
       synchronized (flushLock) {
         if (txid <= this.syncedTillHere) {
           return;
         }
         doneUpto = this.unflushedEntries.get();
-        List<Entry> pending = logSyncerThread.getPendingWrites();
+        pending = logSyncerThread.getPendingWrites();
         try {
           logSyncerThread.hlogFlush(tempWriter, pending);
         } catch(IOException io) {
-          synchronized (this.updateLock) {
+          ioe = io;
+          LOG.error("syncer encountered error, will retry. txid=" + txid, ioe);
+        }
+      }
+      if (ioe != null && pending != null) {
+        synchronized (this.updateLock) {
+          synchronized (flushLock) {
             // HBASE-4387, HBASE-5623, retry with updateLock held
             tempWriter = this.writer;
             logSyncerThread.hlogFlush(tempWriter, pending);
@@ -1281,7 +1333,7 @@ public class HLog implements Syncable {
       }
       try {
         tempWriter.sync();
-      } catch(IOException io) {
+      } catch (IOException io) {
         synchronized (this.updateLock) {
           // HBASE-4387, HBASE-5623, retry with updateLock held
           tempWriter = this.writer;
@@ -1729,6 +1781,11 @@ public class HLog implements Syncable {
     return dir;
   }
   
+  /**
+   * @param filename name of the file to validate
+   * @return <tt>true</tt> if the filename matches an HLog, <tt>false</tt>
+   *         otherwise
+   */
   public static boolean validateHLogFilename(String filename) {
     return pattern.matcher(filename).matches();
   }

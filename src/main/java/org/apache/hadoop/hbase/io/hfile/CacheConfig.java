@@ -115,13 +115,18 @@ public class CacheConfig {
    */
   public CacheConfig(Configuration conf, HColumnDescriptor family) {
     this(CacheConfig.instantiateBlockCache(conf),
-        family.isBlockCacheEnabled(), family.isInMemory(),
-        conf.getBoolean(CACHE_BLOCKS_ON_WRITE_KEY, DEFAULT_CACHE_DATA_ON_WRITE),
+        family.isBlockCacheEnabled(),
+        family.isInMemory(),
+        // For the following flags we enable them regardless of per-schema settings
+        // if they are enabled in the global configuration.
+        conf.getBoolean(CACHE_BLOCKS_ON_WRITE_KEY,
+            DEFAULT_CACHE_DATA_ON_WRITE) || family.shouldCacheDataOnWrite(),
         conf.getBoolean(CACHE_INDEX_BLOCKS_ON_WRITE_KEY,
-            DEFAULT_CACHE_INDEXES_ON_WRITE),
+            DEFAULT_CACHE_INDEXES_ON_WRITE) || family.shouldCacheIndexesOnWrite(),
         conf.getBoolean(CACHE_BLOOM_BLOCKS_ON_WRITE_KEY,
-            DEFAULT_CACHE_BLOOMS_ON_WRITE),
-        conf.getBoolean(EVICT_BLOCKS_ON_CLOSE_KEY, DEFAULT_EVICT_ON_CLOSE),
+            DEFAULT_CACHE_BLOOMS_ON_WRITE) || family.shouldCacheBloomsOnWrite(),
+        conf.getBoolean(EVICT_BLOCKS_ON_CLOSE_KEY,
+            DEFAULT_EVICT_ON_CLOSE) || family.shouldEvictBlocksOnClose(),
         conf.getBoolean(CACHE_DATA_BLOCKS_COMPRESSED_KEY, DEFAULT_COMPRESSED_CACHE)
      );
   }
@@ -344,7 +349,7 @@ public class CacheConfig {
       StringUtils.humanReadableInt(cacheSize));
     if (offHeapCacheSize <= 0) {
       globalBlockCache = new LruBlockCache(cacheSize,
-          StoreFile.DEFAULT_BLOCKSIZE_SMALL);
+          StoreFile.DEFAULT_BLOCKSIZE_SMALL, conf);
     } else {
       globalBlockCache = new DoubleBlockCache(cacheSize, offHeapCacheSize,
           StoreFile.DEFAULT_BLOCKSIZE_SMALL, blockSize, conf);

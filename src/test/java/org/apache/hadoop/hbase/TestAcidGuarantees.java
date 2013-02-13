@@ -30,11 +30,13 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.MultithreadedTestUtil.RepeatingTestThread;
 import org.apache.hadoop.hbase.MultithreadedTestUtil.TestContext;
 import org.apache.hadoop.hbase.client.Get;
+import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.regionserver.ConstantSizeRegionSplitPolicy;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
@@ -81,6 +83,9 @@ public class TestAcidGuarantees implements Tool {
     // Set small flush size for minicluster so we exercise reseeking scanners
     Configuration conf = HBaseConfiguration.create();
     conf.set(HConstants.HREGION_MEMSTORE_FLUSH_SIZE, String.valueOf(128*1024));
+    // prevent aggressive region split
+    conf.set(HConstants.HBASE_REGION_SPLIT_POLICY_KEY,
+      ConstantSizeRegionSplitPolicy.class.getName());
     util = new HBaseTestingUtility(conf);
   }
   
@@ -241,15 +246,6 @@ public class TestAcidGuarantees implements Tool {
       int numGetters,
       int numScanners,
       int numUniqueRows) throws Exception {
-      runTestAtomicity(millisToRun, numWriters, numGetters, numScanners,
-		       numUniqueRows, true);
-  }
-
-  public void runTestAtomicity(long millisToRun,
-      int numWriters,
-      int numGetters,
-      int numScanners,
-      int numUniqueRows, boolean useFlusher) throws Exception {
     createTableIfMissing();
     TestContext ctx = new TestContext(util.getConfiguration());
     
@@ -266,13 +262,12 @@ public class TestAcidGuarantees implements Tool {
       ctx.addThread(writer);
     }
     // Add a flusher
-    if (useFlusher) {
-      ctx.addThread(new RepeatingTestThread(ctx) {
-        public void doAnAction() throws Exception {
-          util.flush();
-        }
-      });
-    }
+    ctx.addThread(new RepeatingTestThread(ctx) {
+      HBaseAdmin admin = new HBaseAdmin(util.getConfiguration());
+      public void doAnAction() throws Exception {
+        admin.flush(TABLE_NAME);
+      }
+    });
 
     List<AtomicGetReader> getters = Lists.newArrayList();
     for (int i = 0; i < numGetters; i++) {
@@ -360,8 +355,7 @@ public class TestAcidGuarantees implements Tool {
     int numGetters = c.getInt("numGetters", 2);
     int numScanners = c.getInt("numScanners", 2);
     int numUniqueRows = c.getInt("numUniqueRows", 3);
-    // cannot run flusher in real cluster case.
-    runTestAtomicity(millis, numWriters, numGetters, numScanners, numUniqueRows, false);
+    runTestAtomicity(millis, numWriters, numGetters, numScanners, numUniqueRows);
     return 0;
   }
 

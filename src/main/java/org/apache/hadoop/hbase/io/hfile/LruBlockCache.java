@@ -96,6 +96,9 @@ public class LruBlockCache implements BlockCache, HeapSize {
 
   static final Log LOG = LogFactory.getLog(LruBlockCache.class);
 
+  static final String LRU_MIN_FACTOR_CONFIG_NAME = "hbase.lru.blockcache.min.factor";
+  static final String LRU_ACCEPTABLE_FACTOR_CONFIG_NAME = "hbase.lru.blockcache.acceptable.factor";
+
   /** Default Configuration Parameters*/
 
   /** Backing Concurrent Map Configuration */
@@ -178,22 +181,27 @@ public class LruBlockCache implements BlockCache, HeapSize {
    * this class.
    * @param maxSize maximum size of cache, in bytes
    * @param blockSize approximate size of each block, in bytes
+   * @param conf configuration
    */
-  public LruBlockCache(long maxSize, long blockSize) {
-    this(maxSize, blockSize, true);
+  public LruBlockCache(long maxSize, long blockSize, Configuration conf) {
+    this(maxSize, blockSize, true, conf);
   }
 
   /**
    * Constructor used for testing.  Allows disabling of the eviction thread.
    */
-  public LruBlockCache(long maxSize, long blockSize, boolean evictionThread) {
+  public LruBlockCache(long maxSize, long blockSize, boolean evictionThread, Configuration conf) {
     this(maxSize, blockSize, evictionThread,
         (int)Math.ceil(1.2*maxSize/blockSize),
-        DEFAULT_LOAD_FACTOR, DEFAULT_CONCURRENCY_LEVEL,
-        DEFAULT_MIN_FACTOR, DEFAULT_ACCEPTABLE_FACTOR,
-        DEFAULT_SINGLE_FACTOR, DEFAULT_MULTI_FACTOR,
+        DEFAULT_LOAD_FACTOR, 
+        DEFAULT_CONCURRENCY_LEVEL,
+        conf.getFloat(LRU_MIN_FACTOR_CONFIG_NAME, DEFAULT_MIN_FACTOR), 
+        conf.getFloat(LRU_ACCEPTABLE_FACTOR_CONFIG_NAME, DEFAULT_ACCEPTABLE_FACTOR), 
+        DEFAULT_SINGLE_FACTOR, 
+        DEFAULT_MULTI_FACTOR,
         DEFAULT_MEMORY_FACTOR);
   }
+
 
   /**
    * Configurable constructor.  Use this constructor if not using defaults.
@@ -319,13 +327,16 @@ public class LruBlockCache implements BlockCache, HeapSize {
    * Get the buffer of the block with the specified name.
    * @param cacheKey block's cache key
    * @param caching true if the caller caches blocks on cache misses
+   * @param repeat Whether this is a repeat lookup for the same block
+   *        (used to avoid double counting cache misses when doing double-check locking)
+   *        {@see HFileReaderV2#readBlock(long, long, boolean, boolean, boolean, BlockType)}
    * @return buffer of specified cache key, or null if not in cache
    */
   @Override
-  public Cacheable getBlock(BlockCacheKey cacheKey, boolean caching) {
+  public Cacheable getBlock(BlockCacheKey cacheKey, boolean caching, boolean repeat) {
     CachedBlock cb = map.get(cacheKey);
     if(cb == null) {
-      stats.miss(caching);
+      if (!repeat) stats.miss(caching);
       return null;
     }
     stats.hit(caching);
@@ -634,7 +645,7 @@ public class LruBlockCache implements BlockCache, HeapSize {
     // Log size
     long totalSize = heapSize();
     long freeSize = maxSize - totalSize;
-    LruBlockCache.LOG.debug("LRU Stats: " +
+    LruBlockCache.LOG.debug("Stats: " +
         "total=" + StringUtils.byteDesc(totalSize) + ", " +
         "free=" + StringUtils.byteDesc(freeSize) + ", " +
         "max=" + StringUtils.byteDesc(this.maxSize) + ", " +
@@ -642,11 +653,11 @@ public class LruBlockCache implements BlockCache, HeapSize {
         "accesses=" + stats.getRequestCount() + ", " +
         "hits=" + stats.getHitCount() + ", " +
         "hitRatio=" +
-          (stats.getHitCount() == 0 ? "0" : (StringUtils.formatPercent(stats.getHitRatio(), 2)+ ", ")) +
+          (stats.getHitCount() == 0 ? "0" : (StringUtils.formatPercent(stats.getHitRatio(), 2)+ ", ")) + ", " +
         "cachingAccesses=" + stats.getRequestCachingCount() + ", " +
         "cachingHits=" + stats.getHitCachingCount() + ", " +
         "cachingHitsRatio=" +
-          (stats.getHitCachingCount() == 0 ? "0" : (StringUtils.formatPercent(stats.getHitCachingRatio(), 2)+ ", ")) +
+          (stats.getHitCachingCount() == 0 ? "0" : (StringUtils.formatPercent(stats.getHitCachingRatio(), 2)+ ", ")) + ", " +
         "evictions=" + stats.getEvictionCount() + ", " +
         "evicted=" + stats.getEvictedCount() + ", " +
         "evictedPerRun=" + stats.evictedPerEviction());

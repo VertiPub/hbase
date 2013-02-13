@@ -96,7 +96,7 @@ public class Result implements Writable, WritableWithSize {
    * @param kvs List of KeyValues
    */
   public Result(List<KeyValue> kvs) {
-    this(kvs.toArray(new KeyValue[0]));
+    this(kvs.toArray(new KeyValue[kvs.size()]));
   }
 
   /**
@@ -462,8 +462,16 @@ public class Result implements Writable, WritableWithSize {
       return;
     }
     byte [] raw = new byte[totalBuffer];
-    in.readFully(raw, 0, totalBuffer);
+    readChunked(in, raw, 0, totalBuffer);
     bytes = new ImmutableBytesWritable(raw, 0, totalBuffer);
+  }
+
+  private void readChunked(final DataInput in, byte[] dest, int ofs, int len)
+  throws IOException {
+    int maxRead = 8192;
+
+    for (; ofs < len; ofs += maxRead)
+      in.readFully(dest, ofs, Math.min(len - ofs, maxRead));
   }
 
   //Create KeyValue[] when needed
@@ -640,5 +648,16 @@ public class Result implements Writable, WritableWithSize {
             + res1.toString() + " compared to " + res2.toString());
       }
     }
+  }
+  
+  /**
+   * Copy another Result into this one. Needed for the old Mapred framework
+   * @param other
+   */
+  public void copyFrom(Result other) {
+    this.row = other.row;
+    this.bytes = other.bytes;
+    this.familyMap = other.familyMap;
+    this.kvs = other.kvs;
   }
 }

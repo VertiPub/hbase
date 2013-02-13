@@ -140,10 +140,9 @@ public class LocalHBaseCluster {
     // clash over default ports.
     conf.set(HConstants.MASTER_PORT, "0");
     conf.set(HConstants.REGIONSERVER_PORT, "0");
+    this.masterClass = (Class<? extends HMaster>)
+      conf.getClass(HConstants.MASTER_IMPL, masterClass);
     // Start the HMasters.
-    this.masterClass =
-      (Class<? extends HMaster>)conf.getClass(HConstants.MASTER_IMPL,
-          masterClass);
     for (int i = 0; i < noMasters; i++) {
       addMaster(new Configuration(conf), i);
     }
@@ -195,9 +194,8 @@ public class LocalHBaseCluster {
     // Create each master with its own Configuration instance so each has
     // its HConnection instance rather than share (see HBASE_INSTANCES down in
     // the guts of HConnectionManager.
-    JVMClusterUtil.MasterThread mt =
-      JVMClusterUtil.createMasterThread(c,
-        this.masterClass, index);
+    JVMClusterUtil.MasterThread mt = JVMClusterUtil.createMasterThread(c,
+        (Class<? extends HMaster>) conf.getClass(HConstants.MASTER_IMPL, this.masterClass), index);
     this.masterThreads.add(mt);
     return mt;
   }

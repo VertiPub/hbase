@@ -19,13 +19,12 @@
  */
 package org.apache.hadoop.hbase;
 
-import java.io.IOException;
 
 /**
  * Subclass if exception is not meant to be retried: e.g.
  * {@link UnknownScannerException}
  */
-public class DoNotRetryIOException extends IOException {
+public class DoNotRetryIOException extends HBaseIOException {
 
   private static final long serialVersionUID = 1197446454511704139L;
 

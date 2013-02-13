@@ -71,10 +71,6 @@ public class ZooKeeperWatcher implements Watcher, Abortable {
   private final List<ZooKeeperListener> listeners =
     new CopyOnWriteArrayList<ZooKeeperListener>();
 
-  // Used by ZKUtil:waitForZKConnectionIfAuthenticating to wait for SASL
-  // negotiation to complete
-  public CountDownLatch saslLatch = new CountDownLatch(1);
-
   // set of unassigned nodes watched
   private Set<String> unassignedNodes = new HashSet<String>();
 
@@ -96,8 +92,13 @@ public class ZooKeeperWatcher implements Watcher, Abortable {
   public String clusterStateZNode;
   // znode used for region transitioning and assignment
   public String assignmentZNode;
-  // znode used for table disabling/enabling
-  public String tableZNode;
+  // znode that the master uses for reading/writing the table disabling/enabling states
+  public String masterTableZNode;
+  // znode where the client reads table enabling/disabling states.
+  public String clientTableZNode;
+  // znode where the master writes table disabling/enabling states in the format expected
+  // by 0.92.0/0.92.1 clients for backwards compatibility.  See HBASE-6710 for details.
+  public String masterTableZNode92;
   // znode containing the unique cluster ID
   public String clusterIdZNode;
   // znode used for log splitting work assignment
@@ -162,7 +163,8 @@ public class ZooKeeperWatcher implements Watcher, Abortable {
       ZKUtil.createAndFailSilent(this, assignmentZNode);
       ZKUtil.createAndFailSilent(this, rsZNode);
       ZKUtil.createAndFailSilent(this, drainingZNode);
-      ZKUtil.createAndFailSilent(this, tableZNode);
+      ZKUtil.createAndFailSilent(this, masterTableZNode);
+      ZKUtil.createAndFailSilent(this, masterTableZNode92);
       ZKUtil.createAndFailSilent(this, splitLogZNode);
       ZKUtil.createAndFailSilent(this, backupMasterAddressesZNode);
     } catch (KeeperException e) {
@@ -210,8 +212,13 @@ public class ZooKeeperWatcher implements Watcher, Abortable {
         conf.get("zookeeper.znode.state", "shutdown"));
     assignmentZNode = ZKUtil.joinZNode(baseZNode,
         conf.get("zookeeper.znode.unassigned", "unassigned"));
-    tableZNode = ZKUtil.joinZNode(baseZNode,
-        conf.get("zookeeper.znode.tableEnableDisable", "table"));
+    String tableZNodeDefault = "table";
+    masterTableZNode = ZKUtil.joinZNode(baseZNode,
+        conf.get("zookeeper.znode.masterTableEnableDisable", tableZNodeDefault));
+    clientTableZNode = ZKUtil.joinZNode(baseZNode,
+            conf.get("zookeeper.znode.clientTableEnableDisable", tableZNodeDefault));
+    masterTableZNode92 = ZKUtil.joinZNode(baseZNode,
+        conf.get("zookeeper.znode.masterTableEnableDisable92", "table92"));
     clusterIdZNode = ZKUtil.joinZNode(baseZNode,
         conf.get("zookeeper.znode.clusterId", "hbaseid"));
     splitLogZNode = ZKUtil.joinZNode(baseZNode,
@@ -241,6 +248,10 @@ public class ZooKeeperWatcher implements Watcher, Abortable {
    */
   public RecoverableZooKeeper getRecoverableZooKeeper() {
     return recoverableZooKeeper;
+  }
+
+  public void reconnectAfterExpiration() throws IOException, InterruptedException {
+    recoverableZooKeeper.reconnectAfterExpiration();
   }
 
   /**
@@ -339,34 +350,12 @@ public class ZooKeeperWatcher implements Watcher, Abortable {
         LOG.debug(this.identifier + " connected");
         break;
 
-      case SaslAuthenticated:
-        if (ZKUtil.isSecureZooKeeper(this.conf)) {
-          // We are authenticated, clients can proceed.
-          saslLatch.countDown();
-        }
-        break;
-
-      case AuthFailed:
-        if (ZKUtil.isSecureZooKeeper(this.conf)) {
-          // We could not be authenticated, but clients should proceed anyway.
-          // Only access to znodes that require SASL authentication will be
-          // denied. The client may never need to access them.
-          saslLatch.countDown();
-        }
-        break;
-
       // Abort the server if Disconnected or Expired
       case Disconnected:
         LOG.debug(prefix("Received Disconnected from ZooKeeper, ignoring"));
         break;
 
       case Expired:
-        if (ZKUtil.isSecureZooKeeper(this.conf)) {
-          // We consider Expired equivalent to AuthFailed for this
-          // connection. Authentication is never going to complete. The
-          // client should proceed to do cleanup.
-          saslLatch.countDown();
-        }
         String msg = prefix(this.identifier + " received expired from " +
           "ZooKeeper, aborting");
         // TODO: One thought is to add call to ZooKeeperListener so say,

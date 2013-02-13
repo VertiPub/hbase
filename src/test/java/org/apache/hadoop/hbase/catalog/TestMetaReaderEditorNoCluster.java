@@ -153,7 +153,7 @@ public class TestMetaReaderEditorNoCluster {
         when(connection).getHRegionConnection(Mockito.anyString(), Mockito.anyInt());
 
       // Now start up the catalogtracker with our doctored Connection.
-      ct = new CatalogTracker(zkw, null, connection, ABORTABLE, 0);
+      ct = new CatalogTracker(zkw, null, connection, ABORTABLE);
       ct.start();
       // Scan meta for user tables and verify we got back expected answer.
       NavigableMap<HRegionInfo, Result> hris = MetaReader.getServerUserRegions(ct, sn);
@@ -166,7 +166,7 @@ public class TestMetaReaderEditorNoCluster {
         openScanner((byte [])Mockito.any(), (Scan)Mockito.any());
     } finally {
       if (ct != null) ct.stop();
-      HConnectionManager.deleteConnection(UTIL.getConfiguration(), true);
+      HConnectionManager.deleteConnection(UTIL.getConfiguration());
       zkw.close();
     }
   }

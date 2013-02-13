@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.net.ConnectException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -48,6 +49,7 @@ import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.hadoop.util.Progressable;
 import org.apache.zookeeper.KeeperException;
+import org.apache.hadoop.hbase.ipc.ServerNotRunningYetException;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -102,7 +104,7 @@ public class TestCatalogTracker {
   private CatalogTracker constructAndStartCatalogTracker(final HConnection c)
   throws IOException, InterruptedException {
     CatalogTracker ct = new CatalogTracker(this.watcher, UTIL.getConfiguration(),
-      c, this.abortable, 0);
+      c, this.abortable);
     ct.start();
     return ct;
   }
@@ -161,7 +163,7 @@ public class TestCatalogTracker {
       // Join the thread... should exit shortly.
       t.join();
     } finally {
-      HConnectionManager.deleteConnection(UTIL.getConfiguration(), true);
+      HConnectionManager.deleteConnection(UTIL.getConfiguration());
     }
   }
 
@@ -208,20 +210,20 @@ public class TestCatalogTracker {
         // So, do this in a thread and then reset meta location to break it out
         // of its wait after a bit of time.
         final AtomicBoolean metaSet = new AtomicBoolean(false);
+        final CountDownLatch latch = new CountDownLatch(1);
         Thread t = new Thread() {
           @Override
           public void run() {
             try {
-              metaSet.set(ct.waitForMetaServerConnectionDefault() !=  null);
-            } catch (NotAllMetaRegionsOnlineException e) {
-              throw new RuntimeException(e);
-            } catch (IOException e) {
+              latch.countDown();
+              metaSet.set(ct.waitForMeta(100000) !=  null);
+            } catch (Exception e) {
               throw new RuntimeException(e);
             }
           }
         };
         t.start();
-        while(!t.isAlive()) Threads.sleep(1);
+        latch.await();
         Threads.sleep(1);
         // Now reset the meta as though it were redeployed.
         ct.setMetaLocation(SN);
@@ -235,18 +237,11 @@ public class TestCatalogTracker {
       }
     } finally {
       // Clear out our doctored connection or could mess up subsequent tests.
-      HConnectionManager.deleteConnection(UTIL.getConfiguration(), true);
+      HConnectionManager.deleteConnection(UTIL.getConfiguration());
     }
   }
 
-  /**
-   * Test we survive a connection refused {@link ConnectException}
-   * @throws IOException
-   * @throws InterruptedException
-   * @throws KeeperException
-   */
-  @Test
-  public void testGetMetaServerConnectionFails()
+  private void testVerifyMetaRegionLocationWithException(Exception ex)
   throws IOException, InterruptedException, KeeperException {
     // Mock an HRegionInterface.
     final HRegionInterface implementation = Mockito.mock(HRegionInterface.class);
@@ -254,7 +249,7 @@ public class TestCatalogTracker {
     try {
       // If a 'get' is called on mocked interface, throw connection refused.
       Mockito.when(implementation.get((byte[]) Mockito.any(), (Get) Mockito.any())).
-        thenThrow(new ConnectException("Connection refused"));
+        thenThrow(ex);
       // Now start up the catalogtracker with our doctored Connection.
       final CatalogTracker ct = constructAndStartCatalogTracker(connection);
       try {
@@ -269,8 +264,39 @@ public class TestCatalogTracker {
       }
     } finally {
       // Clear out our doctored connection or could mess up subsequent tests.
-      HConnectionManager.deleteConnection(UTIL.getConfiguration(), true);
+      HConnectionManager.deleteConnection(UTIL.getConfiguration());
     }
+  }
+
+  /**
+   * Test we survive a connection refused {@link ConnectException}
+   * @throws IOException
+   * @throws InterruptedException
+   * @throws KeeperException
+   */
+  @Test
+  public void testGetMetaServerConnectionFails()
+  throws IOException, InterruptedException, KeeperException {
+    testVerifyMetaRegionLocationWithException(new ConnectException("Connection refused"));
+  }
+
+  /**
+   * Test that verifyMetaRegionLocation properly handles getting a
+   * ServerNotRunningException. See HBASE-4470.
+   * Note this doesn't check the exact exception thrown in the
+   * HBASE-4470 as there it is thrown from getHConnection() and
+   * here it is thrown from get() -- but those are both called
+   * from the same function anyway, and this way is less invasive than
+   * throwing from getHConnection would be.
+   *
+   * @throws IOException
+   * @throws InterruptedException
+   * @throws KeeperException
+   */
+  @Test
+  public void testVerifyMetaRegionServerNotRunning()
+  throws IOException, InterruptedException, KeeperException {
+    testVerifyMetaRegionLocationWithException(new ServerNotRunningYetException("mock"));
   }
 
   /**
@@ -321,7 +347,7 @@ public class TestCatalogTracker {
       final CatalogTracker ct = constructAndStartCatalogTracker(connection);
       ct.waitForMeta(100);
     } finally {
-      HConnectionManager.deleteConnection(UTIL.getConfiguration(), true);
+      HConnectionManager.deleteConnection(UTIL.getConfiguration());
     }
   }
 
@@ -411,20 +437,20 @@ public class TestCatalogTracker {
       // Now meta is available.
       Assert.assertTrue(ct.waitForMeta(10000).equals(SN));
     } finally {
-      HConnectionManager.deleteConnection(UTIL.getConfiguration(), true);
+      HConnectionManager.deleteConnection(UTIL.getConfiguration());
     }
   }
 
   /**
    * @param implementation An {@link HRegionInterface} instance; you'll likely
    * want to pass a mocked HRS; can be null.
-   * @return Mock up a connection that returns a {@link Configuration} when
+   * @return Mock up a connection that returns a {@link org.apache.hadoop.conf.Configuration} when
    * {@link HConnection#getConfiguration()} is called, a 'location' when
    * {@link HConnection#getRegionLocation(byte[], byte[], boolean)} is called,
    * and that returns the passed {@link HRegionInterface} instance when
    * {@link HConnection#getHRegionConnection(String, int)}
    * is called (Be sure call
-   * {@link HConnectionManager#deleteConnection(org.apache.hadoop.conf.Configuration, boolean)}
+   * {@link HConnectionManager#deleteConnection(org.apache.hadoop.conf.Configuration)}
    * when done with this mocked Connection.
    * @throws IOException
    */

@@ -20,6 +20,7 @@
 package org.apache.hadoop.hbase.client;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.io.TimeRange;
@@ -97,6 +98,7 @@ public class Get extends OperationWithAttributes
    * all columns in all families of the specified row.
    * @param row row key
    * @param rowLock previously acquired row lock, or null
+   * @deprecated {@link RowLock} is deprecated, use {@link #Get(byte[])}.
    */
   public Get(byte [] row, RowLock rowLock) {
     this.row = row;
@@ -130,6 +132,9 @@ public class Get extends OperationWithAttributes
     NavigableSet<byte []> set = familyMap.get(family);
     if(set == null) {
       set = new TreeSet<byte []>(Bytes.BYTES_COMPARATOR);
+    }
+    if (qualifier == null) {
+      qualifier = HConstants.EMPTY_BYTE_ARRAY;
     }
     set.add(qualifier);
     familyMap.put(family, set);
@@ -370,6 +375,10 @@ public class Get extends OperationWithAttributes
     map.put("totalColumns", colCount);
     if (this.filter != null) {
       map.put("filter", this.filter.toString());
+    }
+    // add the id if set
+    if (getId() != null) {
+      map.put("id", getId());
     }
     return map;
   }

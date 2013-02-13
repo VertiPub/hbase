@@ -135,10 +135,6 @@ public class StoreFile extends SchemaConfigured {
   /** Key for timestamp of earliest-put in metadata*/
   public static final byte[] EARLIEST_PUT_TS = Bytes.toBytes("EARLIEST_PUT_TS");
 
-  /** Type of encoding used for data blocks in HFile. Stored in file info. */
-  public static final byte[] DATA_BLOCK_ENCODING =
-      Bytes.toBytes("DATA_BLOCK_ENCODING");
-
   // Make default block size for StoreFiles 8k while testing.  TODO: FIX!
   // Need to make it 8k for testing.
   public static final int DEFAULT_BLOCKSIZE_SMALL = 8 * 1024;
@@ -235,7 +231,7 @@ public class StoreFile extends SchemaConfigured {
    * @param dataBlockEncoder data block encoding algorithm.
    * @throws IOException When opening the reader fails.
    */
-  StoreFile(final FileSystem fs,
+  public StoreFile(final FileSystem fs,
             final Path p,
             final Configuration conf,
             final CacheConfig cacheConf,
@@ -324,7 +320,7 @@ public class StoreFile extends SchemaConfigured {
    * @return Calculated path to parent region file.
    * @throws IOException
    */
-  static Path getReferredToFile(final Path p) {
+  public static Path getReferredToFile(final Path p) {
     Matcher m = REF_NAME_PARSER.matcher(p.getName());
     if (m == null || !m.matches()) {
       LOG.warn("Failed match of store file name " + p.toString());
@@ -603,7 +599,16 @@ public class StoreFile extends SchemaConfigured {
    */
   public Reader createReader() throws IOException {
     if (this.reader == null) {
-      this.reader = open();
+      try {
+        this.reader = open();
+      } catch (IOException e) {
+        try {
+          this.closeReader(true);
+        } catch (IOException ee) {              
+        }
+        throw e;
+      }
+
     }
     return this.reader;
   }
@@ -865,13 +870,20 @@ public class StoreFile extends SchemaConfigured {
   }
 
   /**
-   * Write out a split reference.
-   *
-   * Package local so it doesnt leak out of regionserver.
-   *
+   * Validate the store file name.
+   * @param fileName name of the file to validate
+   * @return <tt>true</tt> if the file could be a valid store file, <tt>false</tt> otherwise
+   */
+  public static boolean validateStoreFileName(String fileName) {
+    return !fileName.contains("-");
+  }
+
+  /**
+   * Write out a split reference. Package local so it doesnt leak out of
+   * regionserver.
    * @param fs
    * @param splitDir Presumes path format is actually
-   * <code>SOME_DIRECTORY/REGIONNAME/FAMILY</code>.
+   *          <code>SOME_DIRECTORY/REGIONNAME/FAMILY</code>.
    * @param f File to split.
    * @param splitRow
    * @param range
@@ -1205,9 +1217,6 @@ public class StoreFile extends SchemaConfigured {
     }
 
     public void close() throws IOException {
-      // Save data block encoder metadata in the file info.
-      dataBlockEncoder.saveMetadata(this);
-
       boolean hasGeneralBloom = this.closeGeneralBloomFilter();
       boolean hasDeleteFamilyBloom = this.closeDeleteFamilyBloomFilter();
 

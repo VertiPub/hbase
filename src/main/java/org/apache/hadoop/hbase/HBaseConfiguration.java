@@ -61,7 +61,6 @@ public class HBaseConfiguration extends Configuration {
   }
 
   private static void checkDefaultsVersion(Configuration conf) {
-    if (true) return; // REMOVE
     if (conf.getBoolean("hbase.defaults.for.version.skip", Boolean.FALSE)) return;
     String defaultsVersion = conf.get("hbase.defaults.for.version");
     String thisVersion = VersionInfo.getVersion();
@@ -113,12 +112,14 @@ public class HBaseConfiguration extends Configuration {
   }
 
   /**
-   * Creates a clone of passed configuration.
    * @param that Configuration to clone.
-   * @return a clone of passed configuration.
+   * @return a Configuration created with the hbase-*.xml files plus
+   * the given configuration.
    */
   public static Configuration create(final Configuration that) {
-    return new Configuration(that);
+    Configuration conf = create();
+    merge(conf, that);
+    return conf;
   }
 
   /**
@@ -147,5 +148,13 @@ public class HBaseConfiguration extends Configuration {
       
     }
     return isShowConf;
+  }
+
+  /** For debugging.  Dump configurations to system output as xml format.
+   * Master and RS configurations can also be dumped using
+   * http services. e.g. "curl http://master:60010/dump"
+   */
+  public static void main(String[] args) throws Exception {
+    HBaseConfiguration.create().writeXml(System.out);
   }
 }

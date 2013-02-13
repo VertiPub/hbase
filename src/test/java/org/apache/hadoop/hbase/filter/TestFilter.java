@@ -20,6 +20,8 @@
 
 package org.apache.hadoop.hbase.filter;
 
+import java.io.DataInput;
+import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -41,12 +43,14 @@ import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.junit.experimental.categories.Category;
 
+import com.google.common.base.Throwables;
+
 /**
  * Test filters at the HRegion doorstep.
  */
 @Category(SmallTests.class)
 public class TestFilter extends HBaseTestCase {
-  private final Log LOG = LogFactory.getLog(this.getClass());
+  private final static Log LOG = LogFactory.getLog(TestFilter.class);
   private HRegion region;
 
   //
@@ -1467,8 +1471,14 @@ public class TestFilter extends HBaseTestCase {
 
 
   public void testColumnPaginationFilter() throws Exception {
+      // Test that the filter skips multiple column versions.
+      Put p = new Put(ROWS_ONE[0]);
+      p.setWriteToWAL(false);
+      p.add(FAMILIES[0], QUALIFIERS_ONE[0], VALUES[0]);
+      this.region.put(p);
+      this.region.flushcache();
 
-     // Set of KVs (page: 1; pageSize: 1) - the first set of 1 column per row
+      // Set of KVs (page: 1; pageSize: 1) - the first set of 1 column per row
       KeyValue [] expectedKVs = {
         // testRowOne-0
         new KeyValue(ROWS_ONE[0], FAMILIES[0], QUALIFIERS_ONE[0], VALUES[0]),
@@ -1616,6 +1626,41 @@ public class TestFilter extends HBaseTestCase {
       verifyScanFullNoValues(s, expectedKVs, useLen);
     }
   }
+  
+  /**
+   * Filter which makes sleeps for a second between each row of a scan.
+   * This can be useful for manual testing of bugs like HBASE-5973. For example:
+   * <code>
+   * create 't1', 'f1'
+   * 1.upto(100)  { |x| put 't1', 'r' + x.to_s, 'f1:q1', 'hi' }
+   * import org.apache.hadoop.hbase.filter.TestFilter
+   * scan 't1', { FILTER => TestFilter::SlowScanFilter.new(), CACHE => 50 }
+   * </code>
+   */
+  public static class SlowScanFilter extends FilterBase {
+    private static Thread ipcHandlerThread = null;
+    
+    @Override
+    public void readFields(DataInput arg0) throws IOException {
+    }
+
+    @Override
+    public void write(DataOutput arg0) throws IOException {
+    }
+
+    @Override
+    public boolean filterRow() {
+      ipcHandlerThread = Thread.currentThread();
+      try {
+        LOG.info("Handler thread " + ipcHandlerThread + " sleeping in filter...");
+        Thread.sleep(1000);
+      } catch (InterruptedException e) {
+        Throwables.propagate(e);
+      }
+      return super.filterRow();
+    }
+  }
+
 
   @org.junit.Rule
   public org.apache.hadoop.hbase.ResourceCheckerJUnitRule cu =

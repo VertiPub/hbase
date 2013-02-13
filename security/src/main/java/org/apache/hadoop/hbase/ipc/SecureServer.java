@@ -21,6 +21,7 @@ package org.apache.hadoop.hbase.ipc;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.io.HbaseObjectWritable;
 import org.apache.hadoop.hbase.io.WritableWithSize;
 import org.apache.hadoop.hbase.security.HBaseSaslRpcServer;
@@ -87,9 +88,10 @@ public abstract class SecureServer extends HBaseServer {
   public static final byte CURRENT_VERSION = 4;
   public static final Set<Byte> INSECURE_VERSIONS = ImmutableSet.of((byte) 3);
 
-  public static final Log LOG = LogFactory.getLog("org.apache.hadoop.ipc.SecureServer");
-  private static final Log AUDITLOG =
-    LogFactory.getLog("SecurityLogger.org.apache.hadoop.ipc.SecureServer");
+  public static final Log LOG = LogFactory.getLog(SecureServer.class);
+  private static final Log AUDITLOG = LogFactory.getLog("SecurityLogger." +
+    SecureServer.class.getName());
+
   private static final String AUTH_FAILED_FOR = "Auth failed for ";
   private static final String AUTH_SUCCESSFUL_FOR = "Auth successful for ";
 
@@ -171,9 +173,10 @@ public abstract class SecureServer extends HBaseServer {
           token = ((SecureConnection)connection).saslServer.wrap(buf.array(),
               buf.arrayOffset(), buf.remaining());
         }
-        if (LOG.isDebugEnabled())
-          LOG.debug("Adding saslServer wrapped token of size " + token.length
+        if (LOG.isTraceEnabled()) {
+          LOG.trace("Adding saslServer wrapped token of size " + token.length
               + " as call response.");
+        }
         buf.clear();
         DataOutputStream saslOut = new DataOutputStream(response);
         saslOut.writeInt(token.length);
@@ -276,8 +279,9 @@ public abstract class SecureServer extends HBaseServer {
               UserGroupInformation current = UserGroupInformation
                   .getCurrentUser();
               String fullName = current.getUserName();
-              if (LOG.isDebugEnabled())
-                LOG.debug("Kerberos principal name is " + fullName);
+              if (LOG.isTraceEnabled()) {
+                LOG.trace("Kerberos principal name is " + fullName);
+              }
               final String names[] = HBaseSaslRpcServer.splitKerberosName(fullName);
               if (names.length != 3) {
                 throw new AccessControlException(
@@ -298,13 +302,15 @@ public abstract class SecureServer extends HBaseServer {
               throw new AccessControlException(
                   "Unable to find SASL server implementation for "
                       + authMethod.getMechanismName());
-            if (LOG.isDebugEnabled())
-              LOG.debug("Created SASL server with mechanism = "
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Created SASL server with mechanism = "
                   + authMethod.getMechanismName());
+            }
           }
-          if (LOG.isDebugEnabled())
-            LOG.debug("Have read input token of size " + saslToken.length
+          if (LOG.isTraceEnabled()) {
+            LOG.trace("Have read input token of size " + saslToken.length
                 + " for processing by saslServer.evaluateResponse()");
+          }
           replyToken = saslServer.evaluateResponse(saslToken);
         } catch (IOException e) {
           IOException sendToClient = e;
@@ -325,28 +331,33 @@ public abstract class SecureServer extends HBaseServer {
           throw e;
         }
         if (replyToken != null) {
-          if (LOG.isDebugEnabled())
-            LOG.debug("Will send token of size " + replyToken.length
+          if (LOG.isTraceEnabled()) {
+            LOG.trace("Will send token of size " + replyToken.length
                 + " from saslServer.");
+          }
           doSaslReply(SaslStatus.SUCCESS, new BytesWritable(replyToken), null,
               null);
         }
         if (saslServer.isComplete()) {
-          LOG.debug("SASL server context established. Negotiated QoP is "
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("SASL server context established. Negotiated QoP is "
               + saslServer.getNegotiatedProperty(Sasl.QOP));
+          }
           String qop = (String) saslServer.getNegotiatedProperty(Sasl.QOP);
           useWrap = qop != null && !"auth".equalsIgnoreCase(qop);
           ticket = getAuthorizedUgi(saslServer.getAuthorizationID());
-          LOG.debug("SASL server successfully authenticated client: " + ticket);
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("SASL server successfully authenticated client: " + ticket);
+          }
           rpcMetrics.authenticationSuccesses.inc();
-          AUDITLOG.trace(AUTH_SUCCESSFUL_FOR + ticket);
+          AUDITLOG.info(AUTH_SUCCESSFUL_FOR + ticket);
           saslContextEstablished = true;
         }
       } else {
-        if (LOG.isDebugEnabled())
-          LOG.debug("Have read input token of size " + saslToken.length
+        if (LOG.isTraceEnabled()) {
+          LOG.trace("Have read input token of size " + saslToken.length
               + " for processing by saslServer.unwrap()");
-
+        }
         if (!useWrap) {
           processOneRpc(saslToken);
         } else {
@@ -557,8 +568,9 @@ public abstract class SecureServer extends HBaseServer {
           int unwrappedDataLength = unwrappedDataLengthBuffer.getInt();
 
           if (unwrappedDataLength == HBaseClient.PING_CALL_ID) {
-            if (LOG.isDebugEnabled())
-              LOG.debug("Received ping message");
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Received ping message");
+            }
             unwrappedDataLengthBuffer.clear();
             continue; // ping message
           }
@@ -598,8 +610,8 @@ public abstract class SecureServer extends HBaseServer {
         new DataInputStream(new ByteArrayInputStream(buf));
       int id = dis.readInt();                    // try to read an id
 
-      if (LOG.isDebugEnabled()) {
-        LOG.debug(" got #" + id);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace(" got #" + id);
       }
 
       Writable param = ReflectionUtils.newInstance(paramClass, conf);           // read param
@@ -609,8 +621,13 @@ public abstract class SecureServer extends HBaseServer {
 
       if (priorityCallQueue != null && getQosLevel(param) > highPriorityLevel) {
         priorityCallQueue.put(call);
+        updateCallQueueLenMetrics(priorityCallQueue);
+      } else if (replicationQueue != null && getQosLevel(param) == HConstants.REPLICATION_QOS) {
+        replicationQueue.put(call);
+        updateCallQueueLenMetrics(replicationQueue);
       } else {
         callQueue.put(call);              // queue the call; maybe blocked here
+        updateCallQueueLenMetrics(callQueue);
       }
     }
 
@@ -630,7 +647,9 @@ public abstract class SecureServer extends HBaseServer {
         }
         rpcMetrics.authorizationSuccesses.inc();
       } catch (AuthorizationException ae) {
-        LOG.debug("Connection authorization failed: "+ae.getMessage(), ae);
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Connection authorization failed: "+ae.getMessage(), ae);
+        }
         rpcMetrics.authorizationFailures.inc();
         SecureCall failedCall = new SecureCall(AUTHORIZATION_FAILED_CALLID, null, this,
             null, 0);
@@ -671,8 +690,7 @@ public abstract class SecureServer extends HBaseServer {
         conf, serverName, highPriorityLevel);
     this.authorize =
       conf.getBoolean(HADOOP_SECURITY_AUTHORIZATION, false);
-    this.isSecurityEnabled = UserGroupInformation.isSecurityEnabled();
-    LOG.debug("security enabled="+isSecurityEnabled);
+    this.isSecurityEnabled = User.isHBaseSecurityEnabled(this.conf);
 
     if (isSecurityEnabled) {
       HBaseSaslRpcServer.init(conf);

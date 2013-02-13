@@ -35,6 +35,7 @@ import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.LargeTests;
 import org.apache.hadoop.hbase.MiniHBaseCluster;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
@@ -49,11 +50,15 @@ import org.apache.hadoop.hbase.master.TestMasterFailover;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.JVMClusterUtil.MasterThread;
 import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.hbase.zookeeper.ZKAssign;
+import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.zookeeper.KeeperException;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
+@Category(LargeTests.class)
 public class TestRSKilledWhenMasterInitializing {
   private static final Log LOG = LogFactory.getLog(TestMasterFailover.class);
 
@@ -64,8 +69,11 @@ public class TestRSKilledWhenMasterInitializing {
   @BeforeClass
   public static void setUpBeforeClass() throws Exception {
     // Set it so that this test runs with my custom master
-    TESTUTIL.getConfiguration().setClass(HConstants.MASTER_IMPL,
-        TestingMaster.class, HMaster.class);
+    Configuration conf = TESTUTIL.getConfiguration();
+    conf.setClass(HConstants.MASTER_IMPL, TestingMaster.class, HMaster.class);
+    conf.setInt(ServerManager.WAIT_ON_REGIONSERVERS_MINTOSTART, 3);
+    conf.setInt(ServerManager.WAIT_ON_REGIONSERVERS_MAXTOSTART, 4);
+
     // Start up the cluster.
     TESTUTIL.startMiniCluster(NUM_MASTERS, NUM_RS);
   }
@@ -95,9 +103,8 @@ public class TestRSKilledWhenMasterInitializing {
     }
 
     @Override
-    protected void splitLogAfterStartup(MasterFileSystem mfs,
-        Set<ServerName> onlineServers) {
-      super.splitLogAfterStartup(mfs, onlineServers);
+    protected void splitLogAfterStartup(MasterFileSystem mfs) {
+      super.splitLogAfterStartup(mfs);
       logSplit = true;
       // If "TestingMaster.sleep" is set, sleep after log split.
       if (getConfiguration().getBoolean("TestingMaster.sleep", false)) {
@@ -212,6 +219,10 @@ public class TestRSKilledWhenMasterInitializing {
     while (serverManager.areDeadServersInProgress()) {
       Thread.sleep(100);
     }
+    // Create a ZKW to use in the test
+    ZooKeeperWatcher zkw = HBaseTestingUtility.getZooKeeperWatcher(TESTUTIL);
+    ZKAssign.blockUntilNoRIT(zkw);
+
     table = new HTable(TESTUTIL.getConfiguration(), TABLENAME);
     resultScanner = table.getScanner(new Scan());
     count = 0;

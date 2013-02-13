@@ -51,11 +51,8 @@ import java.util.TreeSet;
  * To scan everything for each row, instantiate a Scan object.
  * <p>
  * To modify scanner caching for just this scan, use {@link #setCaching(int) setCaching}.
- * If caching is NOT set, we will use the caching value of the hosting {@link HTable}.  See
- * {@link HTable#setScannerCaching(int)}. In addition to row caching, it is possible to specify a
- * maximum result size, using {@link #setMaxResultSize(long)}. When both are used,
- * single server requests are limited by either number of rows or maximum result size, whichever
- * limit comes first.
+ * If caching is NOT set, we will use the caching value of the hosting
+ * {@link HTable}.  See {@link HTable#setScannerCaching(int)}.
  * <p>
  * To further define the scope of what to get when scanning, perform additional
  * methods as outlined below.
@@ -85,25 +82,28 @@ import java.util.TreeSet;
  */
 public class Scan extends OperationWithAttributes implements Writable {
   private static final String RAW_ATTR = "_raw_";
+  private static final String ONDEMAND_ATTR = "_ondemand_";
   private static final String ISOLATION_LEVEL = "_isolationlevel_";
 
-  private static final byte SCAN_VERSION = (byte)3;
+  private static final byte SCAN_VERSION = (byte)2;
   private byte [] startRow = HConstants.EMPTY_START_ROW;
   private byte [] stopRow  = HConstants.EMPTY_END_ROW;
   private int maxVersions = 1;
   private int batch = -1;
   // If application wants to collect scan metrics, it needs to
   // call scan.setAttribute(SCAN_ATTRIBUTES_ENABLE, Bytes.toBytes(Boolean.TRUE))
-  static public String SCAN_ATTRIBUTES_METRICS_ENABLE =
-    "scan.attributes.metrics.enable";
-  static public String SCAN_ATTRIBUTES_METRICS_DATA =
-    "scan.attributes.metrics.data";
+  static public String SCAN_ATTRIBUTES_METRICS_ENABLE = "scan.attributes.metrics.enable";
+  static public String SCAN_ATTRIBUTES_METRICS_DATA = "scan.attributes.metrics.data";
+  
+  // If an application wants to use multiple scans over different tables each scan must
+  // define this attribute with the appropriate table name by calling
+  // scan.setAttribute(Scan.SCAN_ATTRIBUTES_TABLE_NAME, Bytes.toBytes(tableName))
+  static public final String SCAN_ATTRIBUTES_TABLE_NAME = "scan.attributes.table.name";
 
   /*
    * -1 means no caching
    */
   private int caching = -1;
-  private long maxResultSize = -1;
   private boolean cacheBlocks = true;
   private Filter filter = null;
   private TimeRange tr = new TimeRange();
@@ -153,7 +153,6 @@ public class Scan extends OperationWithAttributes implements Writable {
     maxVersions = scan.getMaxVersions();
     batch = scan.getBatch();
     caching = scan.getCaching();
-    maxResultSize = scan.getMaxResultSize();
     cacheBlocks = scan.getCacheBlocks();
     filter = scan.getFilter(); // clone?
     TimeRange ctr = scan.getTimeRange();
@@ -219,6 +218,9 @@ public class Scan extends OperationWithAttributes implements Writable {
     NavigableSet<byte []> set = familyMap.get(family);
     if(set == null) {
       set = new TreeSet<byte []>(Bytes.BYTES_COMPARATOR);
+    }
+    if (qualifier == null) {
+      qualifier = HConstants.EMPTY_BYTE_ARRAY;
     }
     set.add(qualifier);
     familyMap.put(family, set);
@@ -325,24 +327,6 @@ public class Scan extends OperationWithAttributes implements Writable {
    */
   public void setCaching(int caching) {
     this.caching = caching;
-  }
-
-  /**
-   * @return the maximum result size in bytes. See {@link #setMaxResultSize(long)}
-   */
-  public long getMaxResultSize() {
-    return maxResultSize;
-  }
-
-  /**
-   * Set the maximum result size. The default is -1; this means that no specific
-   * maximum result size will be set for this scan, and the global configured
-   * value will be used instead. (Defaults to unlimited).
-   *
-   * @param maxResultSize The maximum result size in bytes.
-   */
-  public void setMaxResultSize(long maxResultSize) {
-    this.maxResultSize = maxResultSize;
   }
 
   /**
@@ -480,6 +464,34 @@ public class Scan extends OperationWithAttributes implements Writable {
   }
 
   /**
+   * Set the value indicating whether loading CFs on demand should be allowed (cluster
+   * default is false). On-demand CF loading doesn't load column families until necessary, e.g.
+   * if you filter on one column, the other column family data will be loaded only for the rows
+   * that are included in result, not all rows like in normal case.
+   * With column-specific filters, like SingleColumnValueFilter w/filterIfMissing == true,
+   * this can deliver huge perf gains when there's a cf with lots of data; however, it can
+   * also lead to some inconsistent results, as follows:
+   * - if someone does a concurrent update to both column families in question you may get a row
+   *   that never existed, e.g. for { rowKey = 5, { cat_videos => 1 }, { video => "my cat" } }
+   *   someone puts rowKey 5 with { cat_videos => 0 }, { video => "my dog" }, concurrent scan
+   *   filtering on "cat_videos == 1" can get { rowKey = 5, { cat_videos => 1 },
+   *   { video => "my dog" } }.
+   * - if there's a concurrent split and you have more than 2 column families, some rows may be
+   *   missing some column families.
+   */
+  public void setLoadColumnFamiliesOnDemand(boolean value) {
+    setAttribute(ONDEMAND_ATTR, Bytes.toBytes(value));
+  }
+
+  /**
+   * Get the logical value indicating whether on-demand CF loading should be allowed.
+   */
+  public boolean doLoadColumnFamiliesOnDemand() {
+    byte[] attr = getAttribute(ONDEMAND_ATTR);
+    return attr == null ? false : Bytes.toBoolean(attr);
+  }
+
+  /**
    * Compile the table and column family (i.e. schema) information
    * into a String. Useful for parsing and aggregation by debugging,
    * logging, and administration tools.
@@ -508,7 +520,7 @@ public class Scan extends OperationWithAttributes implements Writable {
    * Useful for debugging, logging, and administration tools.
    * @param maxCols a limit on the number of columns output prior to truncation
    * @return Map
-   */ 
+   */
   @Override
   public Map<String, Object> toMap(int maxCols) {
     // start with the fingerpring map and build on top of it
@@ -523,7 +535,6 @@ public class Scan extends OperationWithAttributes implements Writable {
     map.put("maxVersions", this.maxVersions);
     map.put("batch", this.batch);
     map.put("caching", this.caching);
-    map.put("maxResultSize", this.maxResultSize);
     map.put("cacheBlocks", this.cacheBlocks);
     List<Long> timeRange = new ArrayList<Long>();
     timeRange.add(this.tr.getMin());
@@ -555,6 +566,10 @@ public class Scan extends OperationWithAttributes implements Writable {
     map.put("totalColumns", colCount);
     if (this.filter != null) {
       map.put("filter", this.filter.toString());
+    }
+    // add the id if set
+    if (getId() != null) {
+      map.put("id", getId());
     }
     return map;
   }
@@ -606,9 +621,6 @@ public class Scan extends OperationWithAttributes implements Writable {
     if (version > 1) {
       readAttributes(in);
     }
-    if (version > 2) {
-      this.maxResultSize = in.readLong();
-    }
   }
 
   public void write(final DataOutput out)
@@ -642,7 +654,6 @@ public class Scan extends OperationWithAttributes implements Writable {
       }
     }
     writeAttributes(out);
-    out.writeLong(maxResultSize);
   }
 
   /**

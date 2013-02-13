@@ -17,7 +17,7 @@
 package org.apache.hadoop.hbase.coprocessor;
 
 import java.util.List;
-import java.util.Map;
+import java.util.NavigableSet;
 
 import com.google.common.collect.ImmutableList;
 import org.apache.hadoop.hbase.CoprocessorEnvironment;
@@ -34,11 +34,14 @@ import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.filter.WritableByteArrayComparable;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.InternalScanner;
+import org.apache.hadoop.hbase.regionserver.KeyValueScanner;
 import org.apache.hadoop.hbase.regionserver.RegionScanner;
+import org.apache.hadoop.hbase.regionserver.ScanType;
 import org.apache.hadoop.hbase.regionserver.Store;
 import org.apache.hadoop.hbase.regionserver.StoreFile;
 import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
 import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
+import org.apache.hadoop.hbase.util.Pair;
 
 import java.io.IOException;
 
@@ -55,35 +58,57 @@ public abstract class BaseRegionObserver implements RegionObserver {
   public void stop(CoprocessorEnvironment e) throws IOException { }
 
   @Override
-  public void preOpen(ObserverContext<RegionCoprocessorEnvironment> e) { }
+  public void preOpen(ObserverContext<RegionCoprocessorEnvironment> e) throws IOException { }
 
   @Override
   public void postOpen(ObserverContext<RegionCoprocessorEnvironment> e) { }
 
   @Override
-  public void preClose(ObserverContext<RegionCoprocessorEnvironment> e,
-      boolean abortRequested) { }
+  public void preClose(ObserverContext<RegionCoprocessorEnvironment> c, boolean abortRequested)
+      throws IOException { }
 
   @Override
   public void postClose(ObserverContext<RegionCoprocessorEnvironment> e,
       boolean abortRequested) { }
 
   @Override
-  public void preFlush(ObserverContext<RegionCoprocessorEnvironment> e) { }
+  public InternalScanner preFlushScannerOpen(final ObserverContext<RegionCoprocessorEnvironment> c,
+      final Store store, final KeyValueScanner memstoreScanner, final InternalScanner s)
+      throws IOException {
+    return null;
+  }
 
   @Override
-  public void postFlush(ObserverContext<RegionCoprocessorEnvironment> e) { }
+  public void preFlush(ObserverContext<RegionCoprocessorEnvironment> e) throws IOException {
+  }
 
   @Override
-  public void preSplit(ObserverContext<RegionCoprocessorEnvironment> e) { }
+  public void postFlush(ObserverContext<RegionCoprocessorEnvironment> e) throws IOException {
+  }
 
   @Override
-  public void postSplit(ObserverContext<RegionCoprocessorEnvironment> e,
-      HRegion l, HRegion r) { }
+  public InternalScanner preFlush(ObserverContext<RegionCoprocessorEnvironment> e, Store store,
+      InternalScanner scanner) throws IOException {
+    return scanner;
+  }
+
+  @Override
+  public void postFlush(ObserverContext<RegionCoprocessorEnvironment> e, Store store,
+      StoreFile resultFile) throws IOException {
+  }
+
+  @Override
+  public void preSplit(ObserverContext<RegionCoprocessorEnvironment> e) throws IOException {
+  }
+
+  @Override
+  public void postSplit(ObserverContext<RegionCoprocessorEnvironment> e, HRegion l, HRegion r)
+      throws IOException {
+  }
 
   @Override
   public void preCompactSelection(final ObserverContext<RegionCoprocessorEnvironment> c,
-      final Store store, final List<StoreFile> candidates) { }
+      final Store store, final List<StoreFile> candidates) throws IOException { }
 
   @Override
   public void postCompactSelection(final ObserverContext<RegionCoprocessorEnvironment> c,
@@ -91,13 +116,21 @@ public abstract class BaseRegionObserver implements RegionObserver {
 
   @Override
   public InternalScanner preCompact(ObserverContext<RegionCoprocessorEnvironment> e,
-      final Store store, final InternalScanner scanner) {
+      final Store store, final InternalScanner scanner) throws IOException {
     return scanner;
   }
 
   @Override
-  public void postCompact(ObserverContext<RegionCoprocessorEnvironment> e,
-      final Store store, final StoreFile resultFile) { }
+  public InternalScanner preCompactScannerOpen(final ObserverContext<RegionCoprocessorEnvironment> c,
+      final Store store, List<? extends KeyValueScanner> scanners, final ScanType scanType,
+      final long earliestPutTs, final InternalScanner s) throws IOException {
+    return null;
+  }
+
+  @Override
+  public void postCompact(ObserverContext<RegionCoprocessorEnvironment> e, final Store store,
+      final StoreFile resultFile) throws IOException {
+  }
 
   @Override
   public void preGetClosestRowBefore(final ObserverContext<RegionCoprocessorEnvironment> e,
@@ -231,6 +264,13 @@ public abstract class BaseRegionObserver implements RegionObserver {
   }
 
   @Override
+  public KeyValueScanner preStoreScannerOpen(final ObserverContext<RegionCoprocessorEnvironment> c,
+      final Store store, final Scan scan, final NavigableSet<byte[]> targetCols,
+      final KeyValueScanner s) throws IOException {
+    return null;
+  }
+
+  @Override
   public RegionScanner postScannerOpen(final ObserverContext<RegionCoprocessorEnvironment> e,
       final Scan scan, final RegionScanner s) throws IOException {
     return s;
@@ -251,6 +291,12 @@ public abstract class BaseRegionObserver implements RegionObserver {
   }
 
   @Override
+  public boolean postScannerFilterRow(final ObserverContext<RegionCoprocessorEnvironment> e,
+      final InternalScanner s, final byte[] currentRow, final boolean hasMore) throws IOException {
+    return hasMore;
+  }
+  
+  @Override
   public void preScannerClose(final ObserverContext<RegionCoprocessorEnvironment> e,
       final InternalScanner s) throws IOException {
   }
@@ -269,4 +315,31 @@ public abstract class BaseRegionObserver implements RegionObserver {
   public void postWALRestore(ObserverContext<RegionCoprocessorEnvironment> env,
       HRegionInfo info, HLogKey logKey, WALEdit logEdit) throws IOException {
   }
+
+  @Override
+  public void preBulkLoadHFile(final ObserverContext<RegionCoprocessorEnvironment> ctx,
+    List<Pair<byte[], String>> familyPaths) throws IOException {
+  }
+
+  @Override
+  public boolean postBulkLoadHFile(ObserverContext<RegionCoprocessorEnvironment> ctx,
+    List<Pair<byte[], String>> familyPaths, boolean hasLoaded) throws IOException {
+    return hasLoaded;
+  }
+
+  @Override
+  public void preLockRow(ObserverContext<RegionCoprocessorEnvironment> ctx, byte[] regionName,
+      byte[] row) throws IOException { }
+
+  @Override
+  public void preUnlockRow(ObserverContext<RegionCoprocessorEnvironment> ctx, byte[] regionName,
+      long lockId) throws IOException { }
+
+  @Override
+  public void postLockRow(ObserverContext<RegionCoprocessorEnvironment> ctx, byte[] regionName,
+      byte[] row) throws IOException { }
+
+  @Override
+  public void postUnlockRow(ObserverContext<RegionCoprocessorEnvironment> ctx, byte[] regionName,
+      long lockId) throws IOException { }
 }

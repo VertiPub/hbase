@@ -19,13 +19,15 @@
  */
 package org.apache.hadoop.hbase.client;
 
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertFalse;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -34,9 +36,16 @@ import java.util.concurrent.TimeUnit;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.*;
-import org.apache.hadoop.hbase.client.HTable.DaemonThreadFactory;
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.HBaseTestingUtility;
+import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HRegionLocation;
+import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.ZooKeeperConnectionException;
+import org.apache.hadoop.hbase.client.HConnectionManager.HConnectionImplementation;
+import org.apache.hadoop.hbase.client.HConnectionManager.HConnectionKey;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Threads;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -115,6 +124,28 @@ public class TestHCM {
   private static int getHConnectionManagerCacheSize(){
     return HConnectionTestingUtility.getConnectionCount();
   }
+  
+  @Test
+  public void abortingHConnectionRemovesItselfFromHCM() throws Exception {
+    // Save off current HConnections
+    Map<HConnectionKey, HConnectionImplementation> oldHBaseInstances = 
+        new HashMap<HConnectionKey, HConnectionImplementation>();
+    oldHBaseInstances.putAll(HConnectionManager.HBASE_INSTANCES);
+    
+    HConnectionManager.HBASE_INSTANCES.clear();
+
+    try {
+      HConnection connection = HConnectionManager.getConnection(TEST_UTIL.getConfiguration());
+      connection.abort("test abortingHConnectionRemovesItselfFromHCM", new Exception(
+          "test abortingHConnectionRemovesItselfFromHCM"));
+      Assert.assertNotSame(connection,
+        HConnectionManager.getConnection(TEST_UTIL.getConfiguration()));
+    } finally {
+      // Put original HConnections back
+      HConnectionManager.HBASE_INSTANCES.clear();
+      HConnectionManager.HBASE_INSTANCES.putAll(oldHBaseInstances);
+    }
+  }
 
   /**
    * Test that when we delete a location using the first row of a region
@@ -148,7 +179,7 @@ public class TestHCM {
     ThreadPoolExecutor pool = new ThreadPoolExecutor(1, 10,
         60, TimeUnit.SECONDS,
         new SynchronousQueue<Runnable>(),
-        new DaemonThreadFactory());
+        Threads.newDaemonThreadFactory("test-hcm-table"));
 
     HTable table = new HTable(TABLE_NAME1, conn, pool);
     table.close();
@@ -162,7 +193,7 @@ public class TestHCM {
   }
 
   /**
-   * Make sure that {@link HConfiguration} instances that are essentially the
+   * Make sure that {@link Configuration} instances that are essentially the
    * same map to the same {@link HConnection} instance.
    */
   @Test
@@ -236,7 +267,7 @@ public class TestHCM {
     } finally {
       for (HConnection c: connections) {
         // Clean up connections made so we don't interfere w/ subsequent tests.
-        HConnectionManager.deleteConnection(c.getConfiguration(), true);
+        HConnectionManager.deleteConnection(c.getConfiguration());
       }
     }
   }

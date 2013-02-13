@@ -326,16 +326,13 @@ public class HLogSplitter {
   }
 
   /**
-   * Splits a HLog file into a temporary staging area. tmpname is used to build
-   * the name of the staging area where the recovered-edits will be separated
-   * out by region and stored.
+   * Splits a HLog file into region's recovered-edits directory
    * <p>
    * If the log file has N regions then N recovered.edits files will be
    * produced. There is no buffering in this code. Instead it relies on the
    * buffering in the SequenceFileWriter.
    * <p>
    * @param rootDir
-   * @param tmpname
    * @param logfile
    * @param fs
    * @param conf
@@ -343,16 +340,16 @@ public class HLogSplitter {
    * @return false if it is interrupted by the progress-able.
    * @throws IOException
    */
-  static public boolean splitLogFileToTemp(Path rootDir, String tmpname,
-      FileStatus logfile, FileSystem fs,
-      Configuration conf, CancelableProgressable reporter) throws IOException {
+  static public boolean splitLogFile(Path rootDir, FileStatus logfile,
+      FileSystem fs, Configuration conf, CancelableProgressable reporter)
+      throws IOException {
     HLogSplitter s = new HLogSplitter(conf, rootDir, null, null /* oldLogDir */,
         fs);
-    return s.splitLogFileToTemp(logfile, tmpname, reporter);
+    return s.splitLogFile(logfile, reporter);
   }
 
-  public boolean splitLogFileToTemp(FileStatus logfile, String tmpname,
-      CancelableProgressable reporter)  throws IOException {	    
+  public boolean splitLogFile(FileStatus logfile,
+      CancelableProgressable reporter) throws IOException {
     final Map<byte[], Object> logWriters = Collections.
     synchronizedMap(new TreeMap<byte[], Object>(Bytes.BYTES_COMPARATOR));
     boolean isCorrupted = false;
@@ -384,7 +381,7 @@ public class HLogSplitter {
       in = getReader(fs, logfile, conf, skipErrors);
     } catch (CorruptedLogFileException e) {
       LOG.warn("Could not get reader, corrupted log file " + logPath, e);
-      ZKSplitLog.markCorrupted(rootDir, tmpname, fs);
+      ZKSplitLog.markCorrupted(rootDir, logfile.getPath().getName(), fs);
       isCorrupted = true;
     }
     if (in == null) {
@@ -412,7 +409,7 @@ public class HLogSplitter {
         }
         WriterAndPath wap = (WriterAndPath)o;
         if (wap == null) {
-          wap = createWAP(region, entry, rootDir, tmpname, fs, conf);
+          wap = createWAP(region, entry, rootDir, fs, conf);
           numNewlyOpenedFiles++;
           if (wap == null) {
             // ignore edits from this region. It doesn't exist anymore.
@@ -447,142 +444,116 @@ public class HLogSplitter {
       }
     } catch (CorruptedLogFileException e) {
       LOG.warn("Could not parse, corrupted log file " + logPath, e);
-      ZKSplitLog.markCorrupted(rootDir, tmpname, fs);
+      ZKSplitLog.markCorrupted(rootDir, logfile.getPath().getName(), fs);
       isCorrupted = true;
     } catch (IOException e) {
       e = RemoteExceptionHandler.checkIOException(e);
       throw e;
     } finally {
-      int n = 0;
-      for (Map.Entry<byte[], Object> logWritersEntry : logWriters.entrySet()) {
-        Object o = logWritersEntry.getValue();
-        long t1 = EnvironmentEdgeManager.currentTimeMillis();
-        if ((t1 - last_report_at) > period) {
-          last_report_at = t;
-          if ((progress_failed == false) && (reporter != null) &&
-              (reporter.progress() == false)) {
-            progress_failed = true;
+      boolean allWritersClosed = false;
+      try {
+        int n = 0;
+        for (Map.Entry<byte[], Object> logWritersEntry : logWriters.entrySet()) {
+          Object o = logWritersEntry.getValue();
+          long t1 = EnvironmentEdgeManager.currentTimeMillis();
+          if ((t1 - last_report_at) > period) {
+            last_report_at = t;
+            if ((progress_failed == false) && (reporter != null) && (reporter.progress() == false)) {
+              progress_failed = true;
+            }
+          }
+          if (o == BAD_WRITER) {
+            continue;
+          }
+          n++;
+          WriterAndPath wap = (WriterAndPath) o;
+          wap.writerClosed = true;
+          wap.w.close();
+          LOG.debug("Closed " + wap.p);
+          Path dst = getCompletedRecoveredEditsFilePath(wap.p,
+              outputSink.getRegionMaximumEditLogSeqNum(logWritersEntry.getKey()));
+          if (!dst.equals(wap.p) && fs.exists(dst)) {
+            LOG.warn("Found existing old edits file. It could be the "
+                + "result of a previous failed split attempt. Deleting " + dst + ", length="
+                + fs.getFileStatus(dst).getLen());
+            if (!fs.delete(dst, false)) {
+              LOG.warn("Failed deleting of old " + dst);
+              throw new IOException("Failed deleting of old " + dst);
+            }
+          }
+          // Skip the unit tests which create a splitter that reads and writes the
+          // data without touching disk. TestHLogSplit#testThreading is an
+          // example.
+          if (fs.exists(wap.p)) {
+            if (!fs.rename(wap.p, dst)) {
+              throw new IOException("Failed renaming " + wap.p + " to " + dst);
+            }
+            LOG.debug("Rename " + wap.p + " to " + dst);
           }
         }
-        if (o == BAD_WRITER) {
-          continue;
-        }
-        n++;
-        WriterAndPath wap = (WriterAndPath)o;
-        wap.w.close();
-        LOG.debug("Closed " + wap.p);
-        Path dst = getCompletedRecoveredEditsFilePath(wap.p, outputSink
-            .getRegionMaximumEditLogSeqNum(logWritersEntry.getKey()));
-        if (!dst.equals(wap.p) && fs.exists(dst)) {
-          LOG.warn("Found existing old edits file. It could be the "
-              + "result of a previous failed split attempt. Deleting " + dst
-              + ", length=" + fs.getFileStatus(dst).getLen());
-          if (!fs.delete(dst, false)) {
-            LOG.warn("Failed deleting of old " + dst);
-            throw new IOException("Failed deleting of old " + dst);
+        allWritersClosed = true;
+        String msg = "Processed " + editsCount + " edits across " + n + " regions"
+            + " threw away edits for " + (logWriters.size() - n) + " regions" + "; log file="
+            + logPath + " is corrupted = " + isCorrupted + " progress failed = " + progress_failed;
+        LOG.info(msg);
+        status.markComplete(msg);
+      } finally {
+        if (!allWritersClosed) {
+          for (Map.Entry<byte[], Object> logWritersEntry : logWriters.entrySet()) {
+            Object o = logWritersEntry.getValue();
+            if (o != BAD_WRITER) {
+              WriterAndPath wap = (WriterAndPath) o;
+              try {
+                if (!wap.writerClosed) {
+                  wap.writerClosed = true;
+                  wap.w.close();
+                }
+              } catch (IOException e) {
+                LOG.debug("Exception while closing the writer :", e);
+              }
+            }
           }
         }
-        // Skip the unit tests which create a splitter that reads and writes the
-        // data without touching disk. TestHLogSplit#testThreading is an
-        // example.
-        if (fs.exists(wap.p)) {
-          if (!fs.rename(wap.p, dst)) {
-            throw new IOException("Failed renaming " + wap.p + " to " + dst);
-          }
-          LOG.debug("Rename " + wap.p + " to " + dst);
-        }
+        in.close();
       }
-      String msg = "Processed " + editsCount + " edits across " + n + " regions" +
-        " threw away edits for " + (logWriters.size() - n) + " regions" +
-        "; log file=" + logPath + " is corrupted = " + isCorrupted +
-        " progress failed = " + progress_failed;
-      LOG.info(msg);
-      status.markComplete(msg);
     }
     return !progress_failed;
   }
 
   /**
-   * Completes the work done by splitLogFileToTemp by moving the
-   * recovered.edits from the staging area to the respective region server's
-   * directories.
+   * Completes the work done by splitLogFile by archiving logs
    * <p>
    * It is invoked by SplitLogManager once it knows that one of the
-   * SplitLogWorkers have completed the splitLogFileToTemp() part. If the
-   * master crashes then this function might get called multiple times.
+   * SplitLogWorkers have completed the splitLogFile() part. If the master
+   * crashes then this function might get called multiple times.
    * <p>
-   * @param tmpname
+   * @param logfile
    * @param conf
    * @throws IOException
    */
-  public static void moveRecoveredEditsFromTemp(String tmpname,
-      String logfile, Configuration conf)
-  throws IOException{
+  public static void finishSplitLogFile(String logfile, Configuration conf)
+      throws IOException {
     Path rootdir = FSUtils.getRootDir(conf);
     Path oldLogDir = new Path(rootdir, HConstants.HREGION_OLDLOGDIR_NAME);
-    moveRecoveredEditsFromTemp(tmpname, rootdir, oldLogDir, logfile, conf);
+    finishSplitLogFile(rootdir, oldLogDir, logfile, conf);
   }
 
-  public static void moveRecoveredEditsFromTemp(String tmpname,
-      Path rootdir, Path oldLogDir,
-      String logfile, Configuration conf)
-  throws IOException{
+  public static void finishSplitLogFile(Path rootdir, Path oldLogDir,
+      String logfile, Configuration conf) throws IOException {
     List<Path> processedLogs = new ArrayList<Path>();
     List<Path> corruptedLogs = new ArrayList<Path>();
     FileSystem fs;
     fs = rootdir.getFileSystem(conf);
     Path logPath = new Path(logfile);
-    if (ZKSplitLog.isCorrupted(rootdir, tmpname, fs)) {
+    if (ZKSplitLog.isCorrupted(rootdir, logPath.getName(), fs)) {
       corruptedLogs.add(logPath);
     } else {
       processedLogs.add(logPath);
     }
-    Path stagingDir = ZKSplitLog.getSplitLogDir(rootdir, tmpname);
-    List<FileStatus> files = listAll(fs, stagingDir);
-    for (FileStatus f : files) {
-      Path src = f.getPath();
-      Path dst = ZKSplitLog.stripSplitLogTempDir(rootdir, src);
-      if (ZKSplitLog.isCorruptFlagFile(dst)) {
-        continue;
-      }
-      if (fs.exists(src)) {
-        if (fs.exists(dst)) {
-          fs.delete(dst, false);
-        } else {
-          Path dstdir = dst.getParent();
-          if (!fs.exists(dstdir)) {
-            if (!fs.mkdirs(dstdir)) LOG.warn("mkdir failed on " + dstdir);
-          }
-        }
-        fs.rename(src, dst);
-        LOG.debug(" moved " + src + " => " + dst);
-      } else {
-        LOG.debug("Could not move recovered edits from " + src +
-            " as it doesn't exist");
-      }
-    }
-    archiveLogs(null, corruptedLogs, processedLogs,
-        oldLogDir, fs, conf);
+    archiveLogs(null, corruptedLogs, processedLogs, oldLogDir, fs, conf);
+    Path stagingDir = ZKSplitLog.getSplitLogDir(rootdir, logPath.getName());
     fs.delete(stagingDir, true);
-    return;
   }
-
-  private static List<FileStatus> listAll(FileSystem fs, Path dir)
-  throws IOException {
-    List<FileStatus> fset = new ArrayList<FileStatus>(100);
-    FileStatus [] files = fs.exists(dir)? fs.listStatus(dir): null;
-    if (files != null) {
-      for (FileStatus f : files) {
-        if (f.isDir()) {
-          fset.addAll(listAll(fs, f.getPath()));
-        } else {
-          fset.add(f);
-        }
-      }
-    }
-    return fset;
-  }
-
 
   /**
    * Moves processed logs to a oldLogDir after successful processing Moves
@@ -602,7 +573,7 @@ public class HLogSplitter {
       final List<Path> processedLogs, final Path oldLogDir,
       final FileSystem fs, final Configuration conf) throws IOException {
     final Path corruptDir = new Path(conf.get(HConstants.HBASE_DIR), conf.get(
-        "hbase.regionserver.hlog.splitlog.corrupt.dir", ".corrupt"));
+        "hbase.regionserver.hlog.splitlog.corrupt.dir",  HConstants.CORRUPT_DIR_NAME));
 
     if (!fs.mkdirs(corruptDir)) {
       LOG.info("Unable to mkdir " + corruptDir);
@@ -1074,15 +1045,14 @@ public class HLogSplitter {
     }
   }
 
-  private WriterAndPath createWAP(byte[] region, Entry entry,
-      Path rootdir, String tmpname, FileSystem fs, Configuration conf)
+  private WriterAndPath createWAP(byte[] region, Entry entry, Path rootdir,
+      FileSystem fs, Configuration conf)
   throws IOException {
-    Path regionedits = getRegionSplitEditsPath(fs, entry, rootdir,
-        tmpname==null);
+    Path regionedits = getRegionSplitEditsPath(fs, entry, rootdir, true);
     if (regionedits == null) {
       return null;
     }
-    if ((tmpname == null) && fs.exists(regionedits)) {
+    if (fs.exists(regionedits)) {
       LOG.warn("Found existing old edits file. It could be the "
           + "result of a previous failed split attempt. Deleting "
           + regionedits + ", length="
@@ -1091,18 +1061,10 @@ public class HLogSplitter {
         LOG.warn("Failed delete of old " + regionedits);
       }
     }
-    Path editsfile;
-    if (tmpname != null) {
-      // During distributed log splitting the output by each
-      // SplitLogWorker is written to a temporary area.
-      editsfile = convertRegionEditsToTemp(rootdir, regionedits, tmpname);
-    } else {
-      editsfile = regionedits;
-    }
-    Writer w = createWriter(fs, editsfile, conf);
-    LOG.debug("Creating writer path=" + editsfile + " region="
+    Writer w = createWriter(fs, regionedits, conf);
+    LOG.debug("Creating writer path=" + regionedits + " region="
         + Bytes.toStringBinary(region));
-    return (new WriterAndPath(editsfile, w));
+    return (new WriterAndPath(regionedits, w));
   }
 
   Path convertRegionEditsToTemp(Path rootdir, Path edits, String tmpname) {
@@ -1290,7 +1252,7 @@ public class HLogSplitter {
       if (blacklistedRegions.contains(region)) {
         return null;
       }
-      ret = createWAP(region, entry, rootDir, null, fs, conf);
+      ret = createWAP(region, entry, rootDir, fs, conf);
       if (ret == null) {
         blacklistedRegions.add(region);
         return null;
@@ -1303,8 +1265,15 @@ public class HLogSplitter {
      * Update region's maximum edit log SeqNum.
      */
     void updateRegionMaximumEditLogSeqNum(Entry entry) {
-      regionMaximumEditLogSeqNum.put(entry.getKey().getEncodedRegionName(),
-          entry.getKey().getLogSeqNum());
+      synchronized (regionMaximumEditLogSeqNum) {
+        Long currentMaxSeqNum=regionMaximumEditLogSeqNum.get(entry.getKey().getEncodedRegionName());
+        if (currentMaxSeqNum == null
+            || entry.getKey().getLogSeqNum() > currentMaxSeqNum) {
+          regionMaximumEditLogSeqNum.put(entry.getKey().getEncodedRegionName(),
+              entry.getKey().getLogSeqNum());
+        }
+      }
+
     }
 
     Long getRegionMaximumEditLogSeqNum(byte[] region) {
@@ -1342,6 +1311,11 @@ public class HLogSplitter {
     long editsWritten = 0;
     /* Number of nanos spent writing to this log */
     long nanosSpent = 0;
+    
+    /* To check whether a close has already been tried on the
+     * writer
+     */
+    boolean writerClosed = false;
 
     WriterAndPath(final Path p, final Writer w) {
       this.p = p;

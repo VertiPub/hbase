@@ -24,12 +24,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hbase.regionserver.HRegion;
+import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.metrics.MetricsContext;
 import org.apache.hadoop.metrics.MetricsRecord;
@@ -58,10 +58,12 @@ public class RegionServerDynamicMetrics implements Updater {
   private MetricsContext context;
   private final RegionServerDynamicStatistics rsDynamicStatistics;
   private Method updateMbeanInfoIfMetricsListChanged = null;
+  private HRegionServer regionServer;
   private static final Log LOG =
     LogFactory.getLog(RegionServerDynamicStatistics.class);
   
   private boolean reflectionInitialized = false;
+  private boolean needsUpdateMessage = false;
   private Field recordMetricMapField;
   private Field registryMetricMapField;
 
@@ -72,13 +74,14 @@ public class RegionServerDynamicMetrics implements Updater {
    */
   public final MetricsRegistry registry = new MetricsRegistry();
 
-  private RegionServerDynamicMetrics() {
+  private RegionServerDynamicMetrics(HRegionServer regionServer) {
     this.context = MetricsUtil.getContext("hbase");
     this.metricsRecord = MetricsUtil.createRecord(
                             this.context,
                             "RegionServerDynamicStatistics");
     context.registerUpdater(this);
     this.rsDynamicStatistics = new RegionServerDynamicStatistics(this.registry);
+    this.regionServer = regionServer;
     try {
       updateMbeanInfoIfMetricsListChanged =
         this.rsDynamicStatistics.getClass().getSuperclass()
@@ -90,9 +93,9 @@ public class RegionServerDynamicMetrics implements Updater {
     }
   }
 
-  public static RegionServerDynamicMetrics newInstance() {
+  public static RegionServerDynamicMetrics newInstance(HRegionServer regionServer) {
     RegionServerDynamicMetrics metrics =
-      new RegionServerDynamicMetrics();
+      new RegionServerDynamicMetrics(regionServer);
     return metrics;
   }
 
@@ -100,14 +103,7 @@ public class RegionServerDynamicMetrics implements Updater {
     MetricsLongValue m = (MetricsLongValue)registry.get(name);
     if (m == null) {
       m = new MetricsLongValue(name, this.registry);
-      try {
-        if (updateMbeanInfoIfMetricsListChanged != null) {
-          updateMbeanInfoIfMetricsListChanged.invoke(this.rsDynamicStatistics,
-              new Object[]{});
-        }
-      } catch (Exception e) {
-        LOG.error(e);
-      }
+      this.needsUpdateMessage = true;
     }
     m.set(amt);
   }
@@ -119,14 +115,7 @@ public class RegionServerDynamicMetrics implements Updater {
     MetricsTimeVaryingRate m = (MetricsTimeVaryingRate)registry.get(name);
     if (m == null) {
       m = new MetricsTimeVaryingRate(name, this.registry);
-      try {
-        if (updateMbeanInfoIfMetricsListChanged != null) {
-          updateMbeanInfoIfMetricsListChanged.invoke(this.rsDynamicStatistics,
-              new Object[]{});
-        }
-      } catch (Exception e) {
-        LOG.error(e);
-      }
+      this.needsUpdateMessage = true;
     }
     if (numOps > 0) {
       m.inc(numOps, amt);
@@ -139,7 +128,7 @@ public class RegionServerDynamicMetrics implements Updater {
    */
   @SuppressWarnings("rawtypes")
   public void clear() {
-    
+    this.needsUpdateMessage = true;
     // If this is the first clear use reflection to get the two maps that hold copies of our 
     // metrics on the hadoop metrics side. We have to use reflection because there is not 
     // remove metrics on the hadoop side. If we can't get them then clearing old metrics 
@@ -196,6 +185,13 @@ public class RegionServerDynamicMetrics implements Updater {
     for (Entry<String, AtomicLong> entry : RegionMetricsStorage.getNumericMetrics().entrySet()) {
       this.setNumericMetric(entry.getKey(), entry.getValue().getAndSet(0));
     }
+
+    /* export estimated size of all response queues */
+    if (regionServer != null) {
+      long responseQueueSize = regionServer.getResponseQueueSize();
+      this.setNumericMetric("responseQueuesSize", responseQueueSize);
+    }
+
     /* get dynamically created numeric metrics, and push the metrics.
      * These ones aren't to be reset; they are cumulative. */
     for (Entry<String, AtomicLong> entry : RegionMetricsStorage.getNumericPersistentMetrics().entrySet()) {
@@ -209,6 +205,21 @@ public class RegionServerDynamicMetrics implements Updater {
           value.getFirst().getAndSet(0),
           value.getSecond().getAndSet(0));
     }
+
+    // If there are new metrics sending this message to jmx tells it to update everything.
+    // This is not ideal we should just move to metrics2 that has full support for dynamic metrics.
+    if (needsUpdateMessage) {
+      try {
+        if (updateMbeanInfoIfMetricsListChanged != null) {
+          updateMbeanInfoIfMetricsListChanged.invoke(this.rsDynamicStatistics,
+              new Object[]{});
+        }
+      } catch (Exception e) {
+        LOG.error(e);
+      }
+      needsUpdateMessage = false;
+    }
+
 
     synchronized (registry) {
       // Iterate through the registry to propagate the different rpc metrics.

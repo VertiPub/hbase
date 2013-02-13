@@ -77,6 +77,10 @@ public class TestMetaMigrationRemovingHTD {
     FileSystem fs = FileSystem.get(conf);
     // find where hbase will root itself, so we can copy filesystem there
     Path hbaseRootDir = TEST_UTIL.getDefaultRootDirPath();
+    if (!fs.isDirectory(hbaseRootDir.getParent())) {
+      // mkdir at first
+      fs.mkdirs(hbaseRootDir.getParent());
+    }
     doFsCommand(shell,
       new String [] {"-put", untar.toURI().toString(), hbaseRootDir.toString()});
     // See whats in minihdfs.

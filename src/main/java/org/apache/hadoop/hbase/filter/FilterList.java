@@ -201,11 +201,11 @@ public class FilterList implements Filter {
         }
         ReturnCode code = filter.filterKeyValue(v);
         switch (code) {
+        // Override INCLUDE and continue to evaluate.
+        case INCLUDE_AND_NEXT_COL:
+          rc = ReturnCode.INCLUDE_AND_NEXT_COL;
         case INCLUDE:
           continue;
-        case NEXT_ROW:
-        case SKIP:
-          return ReturnCode.SKIP;
         default:
           return code;
         }
@@ -216,7 +216,12 @@ public class FilterList implements Filter {
 
         switch (filter.filterKeyValue(v)) {
         case INCLUDE:
-          rc = ReturnCode.INCLUDE;
+          if (rc != ReturnCode.INCLUDE_AND_NEXT_COL) {
+            rc = ReturnCode.INCLUDE;
+          }
+          break;
+        case INCLUDE_AND_NEXT_COL:
+          rc = ReturnCode.INCLUDE_AND_NEXT_COL;
           // must continue here to evaluate all filters
         case NEXT_ROW:
         case SKIP:
@@ -248,12 +253,11 @@ public class FilterList implements Filter {
   public boolean filterRow() {
     for (Filter filter : filters) {
       if (operator == Operator.MUST_PASS_ALL) {
-        if (filter.filterAllRemaining() || filter.filterRow()) {
+        if (filter.filterRow()) {
           return true;
         }
       } else if (operator == Operator.MUST_PASS_ONE) {
-        if (!filter.filterAllRemaining()
-            && !filter.filterRow()) {
+        if (!filter.filterRow()) {
           return false;
         }
       }
@@ -310,6 +314,16 @@ public class FilterList implements Filter {
       }
     }
     return keyHint;
+  }
+
+  @Override
+  public boolean isFamilyEssential(byte[] name) {
+    for (Filter filter : filters) {
+      if (filter.isFamilyEssential(name)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   @Override

@@ -48,11 +48,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
@@ -62,8 +64,8 @@ import org.apache.hadoop.hbase.HServerAddress;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.LargeTests;
+import org.apache.hadoop.hbase.MiniHBaseCluster;
 import org.apache.hadoop.hbase.ServerName;
-import org.apache.hadoop.hbase.client.HTable.DaemonThreadFactory;
 import org.apache.hadoop.hbase.client.metrics.ScanMetrics;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
 import org.apache.hadoop.hbase.coprocessor.MultiRowMutationEndpoint;
@@ -84,8 +86,10 @@ import org.apache.hadoop.hbase.io.hfile.BlockCache;
 import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
+import org.apache.hadoop.hbase.regionserver.NoSuchColumnFamilyException;
 import org.apache.hadoop.hbase.regionserver.Store;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.io.DataInputBuffer;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -101,14 +105,15 @@ import org.junit.experimental.categories.Category;
  * Each creates a table named for the method and does its stuff against that.
  */
 @Category(LargeTests.class)
+@SuppressWarnings ("deprecation")
 public class TestFromClientSide {
   final Log LOG = LogFactory.getLog(getClass());
-  private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
+  protected final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
   private static byte [] ROW = Bytes.toBytes("testRow");
   private static byte [] FAMILY = Bytes.toBytes("testFamily");
   private static byte [] QUALIFIER = Bytes.toBytes("testQualifier");
   private static byte [] VALUE = Bytes.toBytes("testValue");
-  private static int SLAVES = 3;
+  protected static int SLAVES = 3;
 
   /**
    * @throws java.lang.Exception
@@ -3612,6 +3617,25 @@ public class TestFromClientSide {
   }
 
   @Test
+  public void testPutNoCF() throws IOException {
+    final byte[] BAD_FAM = Bytes.toBytes("BAD_CF");
+    final byte[] VAL = Bytes.toBytes(100);
+    HTable table = TEST_UTIL.createTable(Bytes.toBytes("testPutNoCF"), new byte[][]{FAMILY});
+
+    boolean caughtNSCFE = false;
+
+    try {
+      Put p = new Put(ROW);
+      p.add(BAD_FAM, QUALIFIER, VAL);
+      table.put(p);
+    } catch (RetriesExhaustedWithDetailsException e) {
+      caughtNSCFE = e.getCause(0) instanceof NoSuchColumnFamilyException;
+    }
+    assertTrue("Should throw NoSuchColumnFamilyException", caughtNSCFE);
+
+  }
+
+  @Test
   public void testRowsPut() throws IOException {
     final byte[] CONTENTS_FAMILY = Bytes.toBytes("contents");
     final byte[] SMALL_FAMILY = Bytes.toBytes("smallfam");
@@ -3866,6 +3890,24 @@ public class TestFromClientSide {
   }
 
   /**
+   * creates an HTable for tableName using an unmanaged HConnection.
+   *
+   * @param tableName - table to create
+   * @return the created HTable object
+   * @throws IOException
+   */
+  HTable createUnmangedHConnectionHTable(final byte [] tableName) throws IOException {
+    TEST_UTIL.createTable(tableName, HConstants.CATALOG_FAMILY);
+    HConnection conn = HConnectionManager.createConnection(TEST_UTIL.getConfiguration());
+    ExecutorService pool = new ThreadPoolExecutor(1, Integer.MAX_VALUE,
+      60, TimeUnit.SECONDS,
+      new SynchronousQueue<Runnable>(),
+      Threads.newDaemonThreadFactory("test-from-client-table"));
+    ((ThreadPoolExecutor)pool).allowCoreThreadTimeOut(true);
+    return new HTable(tableName, conn, pool);
+  }
+
+  /**
    * simple test that just executes parts of the client
    * API that accept a pre-created HConnction instance
    *
@@ -3874,18 +3916,41 @@ public class TestFromClientSide {
   @Test
   public void testUnmanagedHConnection() throws IOException {
     final byte[] tableName = Bytes.toBytes("testUnmanagedHConnection");
-    TEST_UTIL.createTable(tableName, HConstants.CATALOG_FAMILY);
-    HConnection conn = HConnectionManager.createConnection(TEST_UTIL
-        .getConfiguration());
-    ExecutorService pool = new ThreadPoolExecutor(1, Integer.MAX_VALUE,
-        60, TimeUnit.SECONDS,
-        new SynchronousQueue<Runnable>(),
-        new DaemonThreadFactory());
-    ((ThreadPoolExecutor)pool).allowCoreThreadTimeOut(true);
-    HTable t = new HTable(tableName, conn, pool);
+    HTable t = createUnmangedHConnectionHTable(tableName);
+    HBaseAdmin ha = new HBaseAdmin(t.getConnection());
+    assertTrue(ha.tableExists(tableName));
+    assertTrue(t.get(new Get(ROW)).isEmpty());
+  }
+
+  /**
+   * test of that unmanaged HConnections are able to reconnect
+   * properly (see HBASE-5058)
+   *
+   * @throws Exception
+   */
+  @Test
+  public void testUnmanagedHConnectionReconnect() throws Exception {
+    final byte[] tableName = Bytes.toBytes("testUnmanagedHConnectionReconnect");
+    HTable t = createUnmangedHConnectionHTable(tableName);
+    HConnection conn = t.getConnection();
     HBaseAdmin ha = new HBaseAdmin(conn);
     assertTrue(ha.tableExists(tableName));
     assertTrue(t.get(new Get(ROW)).isEmpty());
+
+    // stop the master
+    MiniHBaseCluster cluster = TEST_UTIL.getHBaseCluster();
+    cluster.stopMaster(0, false);
+    cluster.waitOnMaster(0);
+
+    // start up a new master
+    cluster.startMaster();
+    assertTrue(cluster.waitForActiveAndReadyMaster());
+
+    // test that the same unmanaged connection works with a new
+    // HBaseAdmin and can connect to the new master;
+    HBaseAdmin newAdmin = new HBaseAdmin(conn);
+    assertTrue(newAdmin.tableExists(tableName));
+    assert(newAdmin.getClusterStatus().getServersSize() == SLAVES);
   }
 
   @Test
@@ -4117,7 +4182,7 @@ public class TestFromClientSide {
  
   @Test
   public void testIncrementWithDeletes() throws Exception {
-    LOG.info("Starting testIncrement");
+    LOG.info("Starting testIncrementWithDeletes");
     final byte [] TABLENAME = Bytes.toBytes("testIncrementWithDeletes");
     HTable ht = TEST_UTIL.createTable(TABLENAME, FAMILY);
     final byte[] COLUMN = Bytes.toBytes("column");
@@ -4135,6 +4200,34 @@ public class TestFromClientSide {
     assertEquals(1, r.size());
     assertEquals(5, Bytes.toLong(r.getValue(FAMILY, COLUMN)));
   }
+
+  @Test
+  public void testIncrementingInvalidValue() throws Exception {
+    LOG.info("Starting testIncrementingInvalidValue");
+    final byte [] TABLENAME = Bytes.toBytes("testIncrementingInvalidValue");
+    HTable ht = TEST_UTIL.createTable(TABLENAME, FAMILY);
+    final byte[] COLUMN = Bytes.toBytes("column");
+    Put p = new Put(ROW);
+    // write an integer here (not a Long)
+    p.add(FAMILY, COLUMN, Bytes.toBytes(5));
+    ht.put(p);
+    try {
+      ht.incrementColumnValue(ROW, FAMILY, COLUMN, 5);
+      fail("Should have thrown DoNotRetryIOException");
+    } catch (DoNotRetryIOException iox) {
+      // success
+    }
+    Increment inc = new Increment(ROW);
+    inc.addColumn(FAMILY, COLUMN, 5);
+    try {
+      ht.increment(inc);
+      fail("Should have thrown DoNotRetryIOException");
+    } catch (DoNotRetryIOException iox) {
+      // success
+    }
+  }
+
+
 
   @Test
   public void testIncrement() throws Exception {
@@ -4229,9 +4322,9 @@ public class TestFromClientSide {
 
     // Build a SynchronousQueue that we use for thread coordination
     final SynchronousQueue<Object> queue = new SynchronousQueue<Object>();
-    List<Thread> threads = new ArrayList<Thread>(5);
+    List<Runnable> tasks = new ArrayList<Runnable>(5);
     for (int i = 0; i < 5; i++) {
-      threads.add(new Thread() {
+      tasks.add(new Runnable() {
         public void run() {
           try {
             // The thread blocks here until we decide to let it go
@@ -4240,25 +4333,28 @@ public class TestFromClientSide {
         }
       });
     }
-    // First, add two threads and make sure the pool size follows
-    pool.submit(threads.get(0));
+    // First, add two tasks and make sure the pool size follows
+    pool.submit(tasks.get(0));
     assertEquals(1, pool.getPoolSize());
-    pool.submit(threads.get(1));
+    pool.submit(tasks.get(1));
     assertEquals(2, pool.getPoolSize());
 
-    // Next, terminate those threads and then make sure the pool is still the
+    // Next, terminate those tasks and then make sure the pool is still the
     // same size
     queue.put(new Object());
-    threads.get(0).join();
     queue.put(new Object());
-    threads.get(1).join();
     assertEquals(2, pool.getPoolSize());
+
+    //ensure that ThreadPoolExecutor knows that tasks are finished.
+    while (pool.getCompletedTaskCount() < 2) {
+      Threads.sleep(1);
+    }
 
     // Now let's simulate adding a RS meaning that we'll go up to three
     // concurrent threads. The pool should not grow larger than three.
-    pool.submit(threads.get(2));
-    pool.submit(threads.get(3));
-    pool.submit(threads.get(4));
+    pool.submit(tasks.get(2));
+    pool.submit(tasks.get(3));
+    pool.submit(tasks.get(4));
     assertEquals(3, pool.getPoolSize());
     queue.put(new Object());
     queue.put(new Object());
@@ -4339,8 +4435,8 @@ public class TestFromClientSide {
     }
 
     final Object waitLock = new Object();
-
     ExecutorService executorService = Executors.newFixedThreadPool(numVersions);
+    final AtomicReference<AssertionError> error = new AtomicReference<AssertionError>(null);
     for (int versions = numVersions; versions < numVersions * 2; versions++) {
       final int versionsCopy = versions;
       executorService.submit(new Callable<Void>() {
@@ -4365,6 +4461,11 @@ public class TestFromClientSide {
               waitLock.wait();
             }
           } catch (Exception e) {
+          } catch (AssertionError e) {
+            // the error happens in a thread, it won't fail the test,
+            // need to pass it to the caller for proper handling.
+            error.set(e);
+            LOG.error(e);
           }
 
           return null;
@@ -4375,8 +4476,8 @@ public class TestFromClientSide {
       waitLock.notifyAll();
     }
     executorService.shutdownNow();
+    assertNull(error.get());
   }
-
 
   @Test
   public void testCheckAndPut() throws IOException {
@@ -4423,6 +4524,7 @@ public class TestFromClientSide {
   * @throws Exception
   */
   @Test
+  @SuppressWarnings ("unused")
   public void testScanMetrics() throws Exception {
     byte [] TABLENAME = Bytes.toBytes("testScanMetrics");
 
@@ -4491,9 +4593,8 @@ public class TestFromClientSide {
     ScanMetrics scanMetricsWithClose = getScanMetrics(scanWithClose);
     assertEquals("Did not access all the regions in the table", numOfRegions,
         scanMetricsWithClose.countOfRegions.getCurrentIntervalValue());
-
   }
-  
+
   private ScanMetrics getScanMetrics(Scan scan) throws Exception {
     byte[] serializedMetrics = scan.getAttribute(Scan.SCAN_ATTRIBUTES_METRICS_DATA);
     assertTrue("Serialized metrics were not found.", serializedMetrics != null);
@@ -4532,6 +4633,20 @@ public class TestFromClientSide {
     long startBlockCount = cache.getBlockCount();
     long startBlockHits = cache.getStats().getHitCount();
     long startBlockMiss = cache.getStats().getMissCount();
+
+    // wait till baseline is stable, (minimal 500 ms)
+    for (int i = 0; i < 5; i++) {
+      Thread.sleep(100);
+      if (startBlockCount != cache.getBlockCount()
+          || startBlockHits != cache.getStats().getHitCount()
+          || startBlockMiss != cache.getStats().getMissCount()) {
+        startBlockCount = cache.getBlockCount();
+        startBlockHits = cache.getStats().getHitCount();
+        startBlockMiss = cache.getStats().getMissCount();
+        i = -1;
+      }
+    }
+
     // insert data
     Put put = new Put(ROW);
     put.add(FAMILY, QUALIFIER, data);
@@ -4674,7 +4789,6 @@ public class TestFromClientSide {
     HTable table = TEST_UTIL.createTable(TABLE, new byte[][] {FAMILY}, 10);
     int numOfRegions = TEST_UTIL.createMultiRegions(table, FAMILY);
     assertEquals(25, numOfRegions);
-    HBaseAdmin admin = new HBaseAdmin(TEST_UTIL.getConfiguration());
 
     // Get the regions in this range
     List<HRegionLocation> regionsList = table.getRegionsInRange(startKey,
@@ -4719,6 +4833,33 @@ public class TestFromClientSide {
     regionsList = table.getRegionsInRange(startKey, endKey);
     assertEquals(1, regionsList.size());
   }
+
+  @Test
+  public void testJira6912() throws Exception {
+    byte [] TABLE = Bytes.toBytes("testJira6912");
+    HTable foo = TEST_UTIL.createTable(TABLE, new byte[][] {FAMILY}, 10);
+
+    List<Put> puts = new ArrayList<Put>();
+    for (int i=0;i !=100; i++){
+      Put put = new Put(Bytes.toBytes(i));
+      put.add(FAMILY, FAMILY, Bytes.toBytes(i));
+      puts.add(put);
+    }
+    foo.put(puts);
+    // If i comment this out it works
+    TEST_UTIL.flush();
+
+    Scan scan = new Scan();
+    scan.setStartRow(Bytes.toBytes(1));
+    scan.setStopRow(Bytes.toBytes(3));
+    scan.addColumn(FAMILY, FAMILY);
+    scan.setFilter(new RowFilter(CompareFilter.CompareOp.NOT_EQUAL, new BinaryComparator(Bytes.toBytes(1))));
+
+    ResultScanner scanner = foo.getScanner(scan);
+    Result[] bar = scanner.next(100);
+    assertEquals(1, bar.length);
+  }
+
   @org.junit.Rule
   public org.apache.hadoop.hbase.ResourceCheckerJUnitRule cu =
     new org.apache.hadoop.hbase.ResourceCheckerJUnitRule();

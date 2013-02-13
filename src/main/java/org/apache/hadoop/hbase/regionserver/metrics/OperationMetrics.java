@@ -20,7 +20,6 @@ package org.apache.hadoop.hbase.regionserver.metrics;
 
 import java.util.Set;
 
-import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.client.Append;
@@ -37,7 +36,6 @@ import org.apache.hadoop.hbase.util.Bytes;
  * metrics are stored in {@link RegionMetricsStorage} and exposed to hadoop
  * metrics through {@link RegionServerDynamicMetrics}.
  */
-@InterfaceAudience.Private
 public class OperationMetrics {
 
   private static final String DELETE_KEY = "delete_";
@@ -46,17 +44,19 @@ public class OperationMetrics {
   private static final String ICV_KEY = "incrementColumnValue_";
   private static final String INCREMENT_KEY = "increment_";
   private static final String MULTIPUT_KEY = "multiput_";
+  private static final String MULTIDELETE_KEY = "multidelete_";
   private static final String APPEND_KEY = "append_";
   
   /** Conf key controlling whether we should expose metrics.*/
   private static final String CONF_KEY =
       "hbase.metrics.exposeOperationTimes";
 
-  private String tableName = null;
-  private String regionName = null;
-  private String regionMetrixPrefix = null;
-  private Configuration conf = null;
-  
+  private final String tableName;
+  private final String regionName;
+  private final String regionMetrixPrefix;
+  private final Configuration conf;
+  private final boolean exposeTimes;
+
 
   /**
    * Create a new OperationMetrics
@@ -79,6 +79,14 @@ public class OperationMetrics {
       }
       this.regionMetrixPrefix =
           SchemaMetrics.generateRegionMetricsPrefix(this.tableName, this.regionName);
+      this.exposeTimes = this.conf.getBoolean(CONF_KEY, true);
+    } else {
+      //Make all the final values happy.
+      this.conf = null;
+      this.tableName = null;
+      this.regionName = null;
+      this.regionMetrixPrefix = null;
+      this.exposeTimes = false;
     }
   }
   
@@ -101,6 +109,16 @@ public class OperationMetrics {
     doUpdateTimeVarying(columnFamilies, MULTIPUT_KEY, value);
   }
 
+  /**
+   * Update the stats associated with {@link HTable#delete(java.util.List)}.
+   *
+   * @param columnFamilies Set of CF's this multidelete is associated with
+   * @param value the time
+   */
+  public void updateMultiDeleteMetrics(Set<byte[]> columnFamilies, long value) {
+    doUpdateTimeVarying(columnFamilies, MULTIDELETE_KEY, value);
+  }
+  
   /**
    * Update the metrics associated with a {@link Get}
    * 
@@ -203,7 +221,7 @@ public class OperationMetrics {
   }
 
   private void doSafeIncTimeVarying(String prefix, String key, long value) {
-    if (conf.getBoolean(CONF_KEY, true)) {
+    if (exposeTimes) {
       if (prefix != null && !prefix.isEmpty() && key != null && !key.isEmpty()) {
         String m = prefix + key;
         RegionMetricsStorage.incrTimeVaryingMetric(m, value);

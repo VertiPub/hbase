@@ -31,6 +31,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 
+import junit.framework.Assert;
+
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -42,6 +44,7 @@ import org.apache.hadoop.hbase.master.HMaster;
 import org.apache.hadoop.hbase.master.MasterCoprocessorHost;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Threads;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -539,7 +542,7 @@ public class TestMasterObserver {
 
     // modify table
     htd.setMaxFileSize(512 * 1024 * 1024);
-    admin.modifyTable(TEST_TABLE, htd);
+    modifyTableSync(admin, TEST_TABLE, htd);
     // preModifyTable can't bypass default action.
     assertTrue("Test table should have been modified",
       cp.wasModifyTableCalled());
@@ -582,7 +585,7 @@ public class TestMasterObserver {
 
     // modify table
     htd.setMaxFileSize(512 * 1024 * 1024);
-    admin.modifyTable(TEST_TABLE, htd);
+    modifyTableSync(admin, TEST_TABLE, htd);
     assertTrue("Test table should have been modified",
         cp.wasModifyTableCalled());
 
@@ -625,6 +628,19 @@ public class TestMasterObserver {
         admin.tableExists(TEST_TABLE));
     assertTrue("Coprocessor should have been called on table delete",
         cp.wasDeleteTableCalled());
+  }
+
+  private void modifyTableSync(HBaseAdmin admin, byte[] tableName, HTableDescriptor htd)
+      throws IOException {
+    admin.modifyTable(tableName, htd);
+    //wait until modify table finishes
+    for (int t = 0; t < 100; t++) { //10 sec timeout
+      HTableDescriptor td = admin.getTableDescriptor(htd.getName());
+      if (td.equals(htd)) {
+        break;
+      }
+      Threads.sleep(100);
+    }
   }
 
   @Test
@@ -684,6 +700,8 @@ public class TestMasterObserver {
     // move half the open regions from RS 0 to RS 1
     HRegionServer rs = cluster.getRegionServer(0);
     byte[] destRS = Bytes.toBytes(cluster.getRegionServer(1).getServerName().toString());
+    //Make sure no regions are in transition now
+    waitForRITtoBeZero(master);
     List<HRegionInfo> openRegions = rs.getOnlineRegions();
     int moveCnt = openRegions.size()/2;
     for (int i=0; i<moveCnt; i++) {
@@ -692,7 +710,16 @@ public class TestMasterObserver {
         master.move(openRegions.get(i).getEncodedNameAsBytes(), destRS);
       }
     }
+    //Make sure no regions are in transition now
+    waitForRITtoBeZero(master);
+    // now trigger a balance
+    master.balanceSwitch(true);
+    boolean balanceRun = master.balance();
+    assertTrue("Coprocessor should be called on region rebalancing",
+        cp.wasBalanceCalled());
+  }
 
+  private void waitForRITtoBeZero(HMaster master) throws IOException {
     // wait for assignments to finish
     AssignmentManager mgr = master.getAssignmentManager();
     Collection<AssignmentManager.RegionState> transRegions =
@@ -700,13 +727,6 @@ public class TestMasterObserver {
     for (AssignmentManager.RegionState state : transRegions) {
       mgr.waitOnRegionToClearRegionsInTransition(state.getRegion());
     }
-
-    // now trigger a balance
-    master.balanceSwitch(true);
-    boolean balanceRun = master.balance();
-    assertTrue("Coprocessor should be called on region rebalancing",
-        cp.wasBalanceCalled());
-    table.close();
   }
 
   @org.junit.Rule

@@ -29,6 +29,7 @@ import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.commons.logging.Log;
@@ -38,11 +39,14 @@ import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.Server;
 import org.apache.hadoop.hbase.ServerName;
+import org.apache.hadoop.hbase.replication.regionserver.Replication;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.zookeeper.ClusterId;
 import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperListener;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperNodeTracker;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
+import org.apache.hadoop.hbase.zookeeper.ZKUtil.ZKUtilOp;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.KeeperException.ConnectionLossException;
 import org.apache.zookeeper.KeeperException.SessionExpiredException;
@@ -238,19 +242,7 @@ public class ReplicationZookeeper {
     try {
       addresses = fetchSlavesAddresses(peer.getZkw());
     } catch (KeeperException ke) {
-      if (ke instanceof ConnectionLossException
-          || ke instanceof SessionExpiredException) {
-        LOG.warn(
-            "Lost the ZooKeeper connection for peer " + peer.getClusterKey(),
-            ke);
-        try {
-          peer.reloadZkWatcher();
-        } catch(IOException io) {
-          LOG.warn(
-              "Creation of ZookeeperWatcher failed for peer "
-                  + peer.getClusterKey(), io);
-        }
-      }
+      reconnectPeer(ke, peer);
       addresses = Collections.emptyList();
     }
     peer.setRegionServers(addresses);
@@ -398,10 +390,13 @@ public class ReplicationZookeeper {
         throw new IllegalArgumentException("Cannot add existing peer");
       }
       ZKUtil.createWithParents(this.zookeeper, this.peersZNode);
-      ZKUtil.createAndWatch(this.zookeeper,
-          ZKUtil.joinZNode(this.peersZNode, id), Bytes.toBytes(clusterKey));
-      ZKUtil.createAndWatch(this.zookeeper, getPeerStateNode(id),
-          Bytes.toBytes(PeerState.ENABLED.name())); // enabled by default
+      ZKUtil.createAndWatch(this.zookeeper, ZKUtil.joinZNode(this.peersZNode, id),
+        Bytes.toBytes(clusterKey));
+      // There is a race b/w PeerWatcher and ReplicationZookeeper#add method to create the
+      // peer-state znode. This happens while adding a peer.
+      // The peer state data is set as "ENABLED" by default.
+      ZKUtil.createNodeIfNotExistsAndWatch(this.zookeeper, getPeerStateNode(id),
+        Bytes.toBytes(PeerState.ENABLED.name()));
     } catch (KeeperException e) {
       throw new IOException("Unable to add peer", e);
     }
@@ -665,6 +660,58 @@ public class ReplicationZookeeper {
   }
 
   /**
+   * It "atomically" copies all the hlogs queues from another region server and returns them all
+   * sorted per peer cluster (appended with the dead server's znode).
+   * @param znode
+   * @return HLog queues sorted per peer cluster
+   */
+  public SortedMap<String, SortedSet<String>> copyQueuesFromRSUsingMulti(String znode) {
+    SortedMap<String, SortedSet<String>> queues = new TreeMap<String, SortedSet<String>>();
+    String deadRSZnodePath = ZKUtil.joinZNode(rsZNode, znode);// hbase/replication/rs/deadrs
+    List<String> peerIdsToProcess = null;
+    List<ZKUtilOp> listOfOps = new ArrayList<ZKUtil.ZKUtilOp>();
+    try {
+      peerIdsToProcess = ZKUtil.listChildrenNoWatch(this.zookeeper, deadRSZnodePath);
+      if (peerIdsToProcess == null) return null; // node already processed
+      for (String peerId : peerIdsToProcess) {
+        String newPeerId = peerId + "-" + znode;
+        String newPeerZnode = ZKUtil.joinZNode(this.rsServerNameZnode, newPeerId);
+        // check the logs queue for the old peer cluster
+        String oldClusterZnode = ZKUtil.joinZNode(deadRSZnodePath, peerId);
+        List<String> hlogs = ZKUtil.listChildrenNoWatch(this.zookeeper, oldClusterZnode);
+        if (hlogs == null || hlogs.size() == 0) continue; // empty log queue.
+        // create the new cluster znode
+        SortedSet<String> logQueue = new TreeSet<String>();
+        queues.put(newPeerId, logQueue);
+        ZKUtilOp op = ZKUtilOp.createAndFailSilent(newPeerZnode, HConstants.EMPTY_BYTE_ARRAY);
+        listOfOps.add(op);
+        // get the offset of the logs and set it to new znodes
+        for (String hlog : hlogs) {
+          String oldHlogZnode = ZKUtil.joinZNode(oldClusterZnode, hlog);
+          byte[] logOffset = ZKUtil.getData(this.zookeeper, oldHlogZnode);
+          LOG.debug("Creating " + hlog + " with data " + Bytes.toString(logOffset));
+          String newLogZnode = ZKUtil.joinZNode(newPeerZnode, hlog);
+          listOfOps.add(ZKUtilOp.createAndFailSilent(newLogZnode, logOffset));
+          // add ops for deleting
+          listOfOps.add(ZKUtilOp.deleteNodeFailSilent(oldHlogZnode));
+          logQueue.add(hlog);
+        }
+        // add delete op for peer
+        listOfOps.add(ZKUtilOp.deleteNodeFailSilent(oldClusterZnode));
+      }
+      // add delete op for dead rs
+      listOfOps.add(ZKUtilOp.deleteNodeFailSilent(deadRSZnodePath));
+      LOG.debug(" The multi list size is: " + listOfOps.size());
+      ZKUtil.multiOrSequential(this.zookeeper, listOfOps, false);
+      LOG.info("Atomically moved the dead regionserver logs. ");
+    } catch (KeeperException e) {
+      // Multi call failed; it looks like some other regionserver took away the logs.
+      LOG.warn("Got exception in copyQueuesFromRSUsingMulti: ", e);
+    }
+    return queues;
+  }
+
+  /**
    * This methods copies all the hlogs queues from another region server
    * and returns them all sorted per peer cluster (appended with the dead
    * server's znode)
@@ -692,14 +739,14 @@ public class ReplicationZookeeper {
         // number-startcode-number-otherstartcode-number-anotherstartcode-etc
         String newCluster = cluster+"-"+znode;
         String newClusterZnode = ZKUtil.joinZNode(rsServerNameZnode, newCluster);
-        ZKUtil.createNodeIfNotExistsAndWatch(this.zookeeper, newClusterZnode,
-          HConstants.EMPTY_BYTE_ARRAY);
         String clusterPath = ZKUtil.joinZNode(nodePath, cluster);
         List<String> hlogs = ZKUtil.listChildrenNoWatch(this.zookeeper, clusterPath);
         // That region server didn't have anything to replicate for this cluster
         if (hlogs == null || hlogs.size() == 0) {
           continue;
         }
+        ZKUtil.createNodeIfNotExistsAndWatch(this.zookeeper, newClusterZnode,
+            HConstants.EMPTY_BYTE_ARRAY);
         SortedSet<String> logQueue = new TreeSet<String>();
         queues.put(newCluster, logQueue);
         for (String hlog : hlogs) {
@@ -796,6 +843,50 @@ public class ReplicationZookeeper {
     String znode = ZKUtil.joinZNode(clusterZnode, hlog);
     String data = Bytes.toString(ZKUtil.getData(this.zookeeper, znode));
     return data == null || data.length() == 0 ? 0 : Long.parseLong(data);
+  }
+
+  /**
+   * Returns the UUID of the provided peer id. Should a connection loss or session
+   * expiration happen, the ZK handler will be reopened once and if it still doesn't
+   * work then it will bail and return null.
+   * @param peerId the peer's ID that will be converted into a UUID
+   * @return a UUID or null if there's a ZK connection issue
+   */
+  public UUID getPeerUUID(String peerId) {
+    ReplicationPeer peer = getPeerClusters().get(peerId);
+    UUID peerUUID = null;
+    try {
+      peerUUID = getUUIDForCluster(peer.getZkw());
+    } catch (KeeperException ke) {
+      reconnectPeer(ke, peer);
+    }
+    return peerUUID;
+  }
+
+  /**
+   * Get the UUID for the provided ZK watcher. Doesn't handle any ZK exceptions
+   * @param zkw watcher connected to an ensemble
+   * @return the UUID read from zookeeper
+   * @throws KeeperException
+   */
+  public UUID getUUIDForCluster(ZooKeeperWatcher zkw) throws KeeperException {
+    return UUID.fromString(ClusterId.readClusterIdZNode(zkw));
+  }
+
+  private void reconnectPeer(KeeperException ke, ReplicationPeer peer) {
+    if (ke instanceof ConnectionLossException
+      || ke instanceof SessionExpiredException) {
+      LOG.warn(
+        "Lost the ZooKeeper connection for peer " + peer.getClusterKey(),
+        ke);
+      try {
+        peer.reloadZkWatcher();
+      } catch(IOException io) {
+        LOG.warn(
+          "Creation of ZookeeperWatcher failed for peer "
+            + peer.getClusterKey(), io);
+      }
+    }
   }
 
   public void registerRegionServerListener(ZooKeeperListener listener) {

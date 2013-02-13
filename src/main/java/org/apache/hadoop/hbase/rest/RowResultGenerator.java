@@ -29,14 +29,12 @@ import org.apache.commons.logging.LogFactory;
 
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
-import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.HTableInterface;
 import org.apache.hadoop.hbase.client.HTablePool;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.filter.Filter;
-import org.apache.hadoop.hbase.regionserver.NoSuchColumnFamilyException;
 
 public class RowResultGenerator extends ResultGenerator {
   private static final Log LOG = LogFactory.getLog(RowResultGenerator.class);
@@ -59,12 +57,6 @@ public class RowResultGenerator extends ResultGenerator {
             get.addFamily(split[0]);
           }
         }
-      } else {
-        // rowspec does not explicitly specify columns, return them all
-        for (HColumnDescriptor family: 
-            table.getTableDescriptor().getFamilies()) {
-          get.addFamily(family.getName());
-        }
       }
       get.setTimeRange(rowspec.getStartTime(), rowspec.getEndTime());
       get.setMaxVersions(rowspec.getMaxVersions());
@@ -84,7 +76,7 @@ public class RowResultGenerator extends ResultGenerator {
       // the log.
       LOG.warn(StringUtils.stringifyException(e));
     } finally {
-      pool.putTable(table);
+      table.close();
     }
   }
 

@@ -17,7 +17,6 @@
  */
 
 package org.apache.hadoop.hbase.regionserver.wal;
-import org.apache.hadoop.classification.InterfaceAudience;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -37,7 +36,6 @@ import com.google.common.base.Preconditions;
  * A set of static functions for running our custom WAL compression/decompression.
  * Also contains a command line tool to compress and uncompress HLogs.
  */
-@InterfaceAudience.Private
 public class Compressor {
   /**
    * Command line tool to compress and uncompress WALs.
@@ -145,7 +143,12 @@ public class Compressor {
       // the status byte also acts as the higher order byte of the dictionary
       // entry
       short dictIdx = toShort(status, in.readByte());
-      byte[] entry = dict.getEntry(dictIdx);
+      byte[] entry;
+      try {
+        entry = dict.getEntry(dictIdx);
+      } catch (Exception ex) {
+        throw new IOException("Unable to uncompress the log entry", ex);
+      }
       if (entry == null) {
         throw new IOException("Missing dictionary entry for index "
             + dictIdx);

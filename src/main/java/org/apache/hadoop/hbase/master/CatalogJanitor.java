@@ -22,6 +22,7 @@ package org.apache.hadoop.hbase.master;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -38,18 +39,16 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.Server;
-import org.apache.hadoop.hbase.TableExistsException;
+import org.apache.hadoop.hbase.backup.HFileArchiver;
 import org.apache.hadoop.hbase.catalog.MetaEditor;
 import org.apache.hadoop.hbase.catalog.MetaReader;
 import org.apache.hadoop.hbase.client.Result;
-import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.Store;
 import org.apache.hadoop.hbase.regionserver.StoreFile;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.Writables;
-
 
 /**
  * A janitor for the catalog tables.  Scans the <code>.META.</code> catalog
@@ -97,11 +96,10 @@ class CatalogJanitor extends Chore {
   }
 
   /**
-   * Run janitorial scan of catalog <code>.META.</code> table looking for
-   * garbage to collect.
-   * @throws IOException
+   * Scans META and returns a number of scanned rows, and
+   * an ordered map of split parents.
    */
-  void scan() throws IOException {
+  Pair<Integer, Map<HRegionInfo, Result>> getSplitParents() throws IOException {
     // TODO: Only works with single .META. region currently.  Fix.
     final AtomicInteger count = new AtomicInteger(0);
     // Keep Map of found split parents.  There are candidates for cleanup.
@@ -123,18 +121,42 @@ class CatalogJanitor extends Chore {
     };
     // Run full scan of .META. catalog table passing in our custom visitor
     MetaReader.fullScan(this.server.getCatalogTracker(), visitor);
+
+    return new Pair<Integer, Map<HRegionInfo, Result>>(count.get(), splitParents);
+  }
+
+  /**
+   * Run janitorial scan of catalog <code>.META.</code> table looking for
+   * garbage to collect.
+   * @throws IOException
+   */
+  int scan() throws IOException {
+    Pair<Integer, Map<HRegionInfo, Result>> pair = getSplitParents();
+    int count = pair.getFirst();
+    Map<HRegionInfo, Result> splitParents = pair.getSecond();
+
     // Now work on our list of found parents. See if any we can clean up.
     int cleaned = 0;
+    HashSet<String> parentNotCleaned = new HashSet<String>(); //regions whose parents are still around
     for (Map.Entry<HRegionInfo, Result> e : splitParents.entrySet()) {
-      if (cleanParent(e.getKey(), e.getValue())) cleaned++;
+      if (!parentNotCleaned.contains(e.getKey().getEncodedName()) && cleanParent(e.getKey(), e.getValue())) {
+        cleaned++;
+      } else {
+        // We could not clean the parent, so it's daughters should not be cleaned either (HBASE-6160)
+        parentNotCleaned.add(getDaughterRegionInfo(
+              e.getValue(), HConstants.SPLITA_QUALIFIER).getEncodedName());
+        parentNotCleaned.add(getDaughterRegionInfo(
+              e.getValue(), HConstants.SPLITB_QUALIFIER).getEncodedName());
+      }
     }
     if (cleaned != 0) {
-      LOG.info("Scanned " + count.get() + " catalog row(s) and gc'd " + cleaned +
+      LOG.info("Scanned " + count + " catalog row(s) and gc'd " + cleaned +
         " unreferenced parent region(s)");
     } else if (LOG.isDebugEnabled()) {
-      LOG.debug("Scanned " + count.get() + " catalog row(s) and gc'd " + cleaned +
+      LOG.debug("Scanned " + count + " catalog row(s) and gc'd " + cleaned +
       " unreferenced parent region(s)");
     }
+    return cleaned;
   }
 
   /**
@@ -192,7 +214,7 @@ class CatalogJanitor extends Chore {
 
   /**
    * If daughters no longer hold reference to the parents, delete the parent.
-   * @param server HRegionInterface of meta server to talk to 
+   * @param server HRegionInterface of meta server to talk to
    * @param parent HRegionInfo of split offlined parent
    * @param rowContent Content of <code>parent</code> row in
    * <code>metaRegionName</code>
@@ -213,7 +235,7 @@ class CatalogJanitor extends Chore {
     if (hasNoReferences(a) && hasNoReferences(b)) {
       LOG.debug("Deleting region " + parent.getRegionNameAsString() +
         " because daughter splits no longer hold references");
-	  // wipe out daughter references from parent region
+      // wipe out daughter references from parent region in meta
       removeDaughtersFromParent(parent);
 
       // This latter regionOffline should not be necessary but is done for now
@@ -224,8 +246,7 @@ class CatalogJanitor extends Chore {
         this.services.getAssignmentManager().regionOffline(parent);
       }
       FileSystem fs = this.services.getMasterFileSystem().getFileSystem();
-      Path rootdir = this.services.getMasterFileSystem().getRootDir();
-      HRegion.deleteRegion(fs, rootdir, parent);
+      HFileArchiver.archiveRegion(this.services.getConfiguration(), fs, parent);
       MetaEditor.deleteRegion(this.server.getCatalogTracker(), parent);
       result = true;
     }
@@ -270,7 +291,7 @@ class CatalogJanitor extends Chore {
   /**
    * Checks if a daughter region -- either splitA or splitB -- still holds
    * references to parent.
-   * @param parent Parent region name. 
+   * @param parent Parent region name.
    * @param split Which column family.
    * @param qualifier Which of the daughters to look at, splitA or splitB.
    * @return A pair where the first boolean says whether or not the daughter

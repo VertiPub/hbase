@@ -31,7 +31,7 @@ import org.apache.hadoop.hbase.metrics.HBaseInfo;
 import org.apache.hadoop.hbase.metrics.MetricsRate;
 import org.apache.hadoop.hbase.metrics.PersistentMetricsTimeVaryingRate;
 import org.apache.hadoop.hbase.metrics.histogram.MetricsHistogram;
-import org.apache.hadoop.hbase.metrics.histogram.Snapshot;
+import com.yammer.metrics.stats.Snapshot;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.Strings;
@@ -130,25 +130,6 @@ public class RegionServerMetrics implements Updater {
   /** Block hit caching ratio for past N periods */
   public final MetricsIntValue blockCacheHitCachingRatioPastNPeriods = new MetricsIntValue("blockCacheHitCachingRatioPastNPeriods", registry);
 
-  /**
-   * a latency histogram on 'get' requests
-   */
-  public final MetricsHistogram getLatencies = 
-      new MetricsHistogram("getRequestLatency", registry);
- 
-  /**
-   * a latency histogram on 'delete' requests
-   */
-  public final MetricsHistogram deleteLatencies = 
-      new MetricsHistogram("deleteRequestLatency", registry);
- 
-  /**
-   * a latency histogram on 'put' requests
-   */
-  public final MetricsHistogram putLatencies = 
-      new MetricsHistogram("putRequestLatency", registry);
- 
-  
   /*
    * Count of requests to the regionservers since last call to metrics update
    */
@@ -316,6 +297,18 @@ public class RegionServerMetrics implements Updater {
   public final MetricsLongValue checksumFailuresCount =
     new MetricsLongValue("checksumFailuresCount", registry);
 
+  /**
+   * time blocked on lack of resources
+   */
+  public final MetricsHistogram updatesBlockedSeconds = new MetricsHistogram(
+      "updatesBlockedSeconds", registry);
+
+  /**
+   * time blocked on memstoreHW
+   */
+  public final MetricsHistogram updatesBlockedSecondsHighWater = new MetricsHistogram(
+      "updatesBlockedSecondsHighWater",registry);
+
   public RegionServerMetrics() {
     MetricsContext context = MetricsUtil.getContext("hbase");
     metricsRecord = MetricsUtil.createRecord(context, "regionserver");
@@ -395,10 +388,6 @@ public class RegionServerMetrics implements Updater {
       this.blockCacheHitRatioPastNPeriods.pushMetric(this.metricsRecord);
       this.blockCacheHitCachingRatioPastNPeriods.pushMetric(this.metricsRecord);
 
-      this.putLatencies.pushMetric(this.metricsRecord);
-      this.deleteLatencies.pushMetric(this.metricsRecord);
-      this.getLatencies.pushMetric(this.metricsRecord);
-      
       // Mix in HFile and HLog metrics
       // Be careful. Here is code for MTVR from up in hadoop:
       // public synchronized void inc(final int numOps, final long time) {
@@ -459,6 +448,8 @@ public class RegionServerMetrics implements Updater {
       this.regionSplitSuccessCount.pushMetric(this.metricsRecord);
       this.regionSplitFailureCount.pushMetric(this.metricsRecord);
       this.checksumFailuresCount.pushMetric(this.metricsRecord);
+      this.updatesBlockedSeconds.pushMetric(this.metricsRecord);
+      this.updatesBlockedSecondsHighWater.pushMetric(this.metricsRecord);
     }
     this.metricsRecord.update();
   }
@@ -586,9 +577,6 @@ public class RegionServerMetrics implements Updater {
         Long.valueOf(this.hdfsBlocksLocalityIndex.get()));
     sb = Strings.appendKeyValue(sb, "slowHLogAppendCount",
         Long.valueOf(this.slowHLogAppendCount.get()));
-    sb = appendHistogram(sb, this.deleteLatencies);
-    sb = appendHistogram(sb, this.getLatencies);
-    sb = appendHistogram(sb, this.putLatencies);
     sb = appendHistogram(sb, this.fsReadLatencyHistogram);
     sb = appendHistogram(sb, this.fsPreadLatencyHistogram);
     sb = appendHistogram(sb, this.fsWriteLatencyHistogram);

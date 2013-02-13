@@ -32,6 +32,7 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.filter.Filter;
+import org.apache.hadoop.hbase.regionserver.Store.ScanInfo;
 import org.apache.hadoop.hbase.regionserver.metrics.RegionMetricsStorage;
 import org.apache.hadoop.hbase.regionserver.metrics.SchemaMetrics;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -41,7 +42,7 @@ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
  * Scanner scans both the memstore and the HStore. Coalesce KeyValue stream
  * into List<KeyValue> for a single row.
  */
-class StoreScanner extends NonLazyKeyValueScanner
+public class StoreScanner extends NonLazyKeyValueScanner
     implements KeyValueScanner, InternalScanner, ChangedReadersObserver {
   static final Log LOG = LogFactory.getLog(StoreScanner.class);
   private Store store;
@@ -49,8 +50,8 @@ class StoreScanner extends NonLazyKeyValueScanner
   private KeyValueHeap heap;
   private boolean cacheBlocks;
 
-  private String metricNameGetSize;
 
+  private String metricNamePrefix;
   // Used to indicate that the scanner has closed (see HBASE-1107)
   // Doesnt need to be volatile because it's always accessed via synchronized methods
   private boolean closing = false;
@@ -101,16 +102,16 @@ class StoreScanner extends NonLazyKeyValueScanner
    * @param columns which columns we are scanning
    * @throws IOException
    */
-  StoreScanner(Store store, Scan scan, final NavigableSet<byte[]> columns)
+  public StoreScanner(Store store, ScanInfo scanInfo, Scan scan, final NavigableSet<byte[]> columns)
                               throws IOException {
-    this(store, scan.getCacheBlocks(), scan, columns, store.scanInfo.getTtl(),
-        store.scanInfo.getMinVersions());
+    this(store, scan.getCacheBlocks(), scan, columns, scanInfo.getTtl(),
+        scanInfo.getMinVersions());
     initializeMetricNames();
     if (columns != null && scan.isRaw()) {
       throw new DoNotRetryIOException(
           "Cannot specify any column for a raw scan");
     }
-    matcher = new ScanQueryMatcher(scan, store.scanInfo, columns,
+    matcher = new ScanQueryMatcher(scan, scanInfo, columns,
         ScanType.USER_SCAN, Long.MAX_VALUE, HConstants.LATEST_TIMESTAMP,
         oldestUnexpiredTS);
 
@@ -147,13 +148,13 @@ class StoreScanner extends NonLazyKeyValueScanner
    * @param smallestReadPoint the readPoint that we should use for tracking
    *          versions
    */
-  StoreScanner(Store store, Scan scan,
+  public StoreScanner(Store store, ScanInfo scanInfo, Scan scan,
       List<? extends KeyValueScanner> scanners, ScanType scanType,
       long smallestReadPoint, long earliestPutTs) throws IOException {
-    this(store, false, scan, null, store.scanInfo.getTtl(),
-        store.scanInfo.getMinVersions());
+    this(store, false, scan, null, scanInfo.getTtl(),
+        scanInfo.getMinVersions());
     initializeMetricNames();
-    matcher = new ScanQueryMatcher(scan, store.scanInfo, null, scanType,
+    matcher = new ScanQueryMatcher(scan, scanInfo, null, scanType,
         smallestReadPoint, earliestPutTs, oldestUnexpiredTS);
 
     // Filter the list of scanners using Bloom filters, time range, TTL, etc.
@@ -170,7 +171,7 @@ class StoreScanner extends NonLazyKeyValueScanner
 
   /** Constructor for testing. */
   StoreScanner(final Scan scan, Store.ScanInfo scanInfo,
-      StoreScanner.ScanType scanType, final NavigableSet<byte[]> columns,
+      ScanType scanType, final NavigableSet<byte[]> columns,
       final List<KeyValueScanner> scanners) throws IOException {
     this(scan, scanInfo, scanType, columns, scanners,
         HConstants.LATEST_TIMESTAMP);
@@ -178,7 +179,7 @@ class StoreScanner extends NonLazyKeyValueScanner
 
   // Constructor for testing.
   StoreScanner(final Scan scan, Store.ScanInfo scanInfo,
-      StoreScanner.ScanType scanType, final NavigableSet<byte[]> columns,
+      ScanType scanType, final NavigableSet<byte[]> columns,
       final List<KeyValueScanner> scanners, long earliestPutTs)
           throws IOException {
     this(null, scan.getCacheBlocks(), scan, columns, scanInfo.getTtl(),
@@ -197,7 +198,7 @@ class StoreScanner extends NonLazyKeyValueScanner
   /**
    * Method used internally to initialize metric names throughout the
    * constructors.
-   * 
+   *
    * To be called after the store variable has been initialized!
    */
   private void initializeMetricNames() {
@@ -207,8 +208,8 @@ class StoreScanner extends NonLazyKeyValueScanner
       tableName = store.getTableName();
       family = Bytes.toString(store.getFamily().getName());
     }
-    metricNameGetSize = SchemaMetrics.generateSchemaMetricsPrefix(
-        tableName, family) + "getsize";
+    this.metricNamePrefix =
+        SchemaMetrics.generateSchemaMetricsPrefix(tableName, family);
   }
 
   /**
@@ -307,6 +308,18 @@ class StoreScanner extends NonLazyKeyValueScanner
    */
   @Override
   public synchronized boolean next(List<KeyValue> outResult, int limit) throws IOException {
+    return next(outResult, limit, null);
+  }
+
+  /**
+   * Get the next row of values from this Store.
+   * @param outResult
+   * @param limit
+   * @return true if there are more rows, false if scanner is done
+   */
+  @Override
+  public synchronized boolean next(List<KeyValue> outResult, int limit,
+      String metric) throws IOException {
 
     if (checkReseek()) {
       return true;
@@ -327,102 +340,102 @@ class StoreScanner extends NonLazyKeyValueScanner
 
     // only call setRow if the row changes; avoids confusing the query matcher
     // if scanning intra-row
-    if ((matcher.row == null) || !peeked.matchingRow(matcher.row)) {
-      matcher.setRow(peeked.getRow());
+    byte[] row = peeked.getBuffer();
+    int offset = peeked.getRowOffset();
+    short length = peeked.getRowLength();
+    if ((matcher.row == null) || !Bytes.equals(row, offset, length, matcher.row, matcher.rowOffset, matcher.rowLength)) {
+      matcher.setRow(row, offset, length);
     }
 
     KeyValue kv;
     KeyValue prevKV = null;
-    List<KeyValue> results = new ArrayList<KeyValue>();
 
     // Only do a sanity-check if store and comparator are available.
     KeyValue.KVComparator comparator =
         store != null ? store.getComparator() : null;
 
-    LOOP: while((kv = this.heap.peek()) != null) {
-      // Check that the heap gives us KVs in an increasing order.
-      if (prevKV != null && comparator != null
-          && comparator.compare(prevKV, kv) > 0) {
-        throw new IOException("Key " + prevKV + " followed by a " +
-            "smaller key " + kv + " in cf " + store);
-      }
-      prevKV = kv;
-      ScanQueryMatcher.MatchCode qcode = matcher.match(kv);
-      switch(qcode) {
-        case INCLUDE:
-        case INCLUDE_AND_SEEK_NEXT_ROW:
-        case INCLUDE_AND_SEEK_NEXT_COL:
+    long cumulativeMetric = 0;
+    int count = 0;
+    try {
+      LOOP: while((kv = this.heap.peek()) != null) {
+        // Check that the heap gives us KVs in an increasing order.
+        assert prevKV == null || comparator == null || comparator.compare(prevKV, kv) <= 0 :
+          "Key " + prevKV + " followed by a " + "smaller key " + kv + " in cf " + store;
+        prevKV = kv;
+        ScanQueryMatcher.MatchCode qcode = matcher.match(kv);
+        switch(qcode) {
+          case INCLUDE:
+          case INCLUDE_AND_SEEK_NEXT_ROW:
+          case INCLUDE_AND_SEEK_NEXT_COL:
 
-          Filter f = matcher.getFilter();
-          results.add(f == null ? kv : f.transform(kv));
+            Filter f = matcher.getFilter();
+            outResult.add(f == null ? kv : f.transform(kv));
+            count++;
 
-          if (qcode == ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_ROW) {
+            if (qcode == ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_ROW) {
+              if (!matcher.moreRowsMayExistAfter(kv)) {
+                return false;
+              }
+              reseek(matcher.getKeyForNextRow(kv));
+            } else if (qcode == ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_COL) {
+              reseek(matcher.getKeyForNextColumn(kv));
+            } else {
+              this.heap.next();
+            }
+
+            cumulativeMetric += kv.getLength();
+            if (limit > 0 && (count == limit)) {
+              break LOOP;
+            }
+            continue;
+
+          case DONE:
+            return true;
+
+          case DONE_SCAN:
+            close();
+
+            return false;
+
+          case SEEK_NEXT_ROW:
+            // This is just a relatively simple end of scan fix, to short-cut end
+            // us if there is an endKey in the scan.
             if (!matcher.moreRowsMayExistAfter(kv)) {
-              outResult.addAll(results);
               return false;
             }
+
             reseek(matcher.getKeyForNextRow(kv));
-          } else if (qcode == ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_COL) {
+            break;
+
+          case SEEK_NEXT_COL:
             reseek(matcher.getKeyForNextColumn(kv));
-          } else {
+            break;
+
+          case SKIP:
             this.heap.next();
-          }
+            break;
 
-          RegionMetricsStorage.incrNumericMetric(metricNameGetSize, kv.getLength());
-          if (limit > 0 && (results.size() == limit)) {
-            break LOOP;
-          }
-          continue;
+          case SEEK_NEXT_USING_HINT:
+            KeyValue nextKV = matcher.getNextKeyHint(kv);
+            if (nextKV != null) {
+              reseek(nextKV);
+            } else {
+              heap.next();
+            }
+            break;
 
-        case DONE:
-          // copy jazz
-          outResult.addAll(results);
-          return true;
-
-        case DONE_SCAN:
-          close();
-
-          // copy jazz
-          outResult.addAll(results);
-
-          return false;
-
-        case SEEK_NEXT_ROW:
-          // This is just a relatively simple end of scan fix, to short-cut end
-          // us if there is an endKey in the scan.
-          if (!matcher.moreRowsMayExistAfter(kv)) {
-            outResult.addAll(results);
-            return false;
-          }
-
-          reseek(matcher.getKeyForNextRow(kv));
-          break;
-
-        case SEEK_NEXT_COL:
-          reseek(matcher.getKeyForNextColumn(kv));
-          break;
-
-        case SKIP:
-          this.heap.next();
-          break;
-
-        case SEEK_NEXT_USING_HINT:
-          KeyValue nextKV = matcher.getNextKeyHint(kv);
-          if (nextKV != null) {
-            reseek(nextKV);
-          } else {
-            heap.next();
-          }
-          break;
-
-        default:
-          throw new RuntimeException("UNEXPECTED");
+          default:
+            throw new RuntimeException("UNEXPECTED");
+        }
+      }
+    } finally {
+      if (cumulativeMetric > 0 && metric != null) {
+        RegionMetricsStorage.incrNumericMetric(this.metricNamePrefix + metric,
+            cumulativeMetric);
       }
     }
 
-    if (!results.isEmpty()) {
-      // copy jazz
-      outResult.addAll(results);
+    if (count > 0) {
       return true;
     }
 
@@ -433,7 +446,13 @@ class StoreScanner extends NonLazyKeyValueScanner
 
   @Override
   public synchronized boolean next(List<KeyValue> outResult) throws IOException {
-    return next(outResult, -1);
+    return next(outResult, -1, null);
+  }
+
+  @Override
+  public synchronized boolean next(List<KeyValue> outResult, String metric)
+      throws IOException {
+    return next(outResult, -1, metric);
   }
 
   // Implementation of ChangedReadersObserver
@@ -469,7 +488,7 @@ class StoreScanner extends NonLazyKeyValueScanner
     if (this.heap == null && this.lastTop != null) {
       resetScannerStack(this.lastTop);
       if (this.heap.peek() == null
-          || store.comparator.compare(this.lastTop, this.heap.peek()) != 0) {
+          || store.comparator.compareRows(this.lastTop, this.heap.peek()) != 0) {
         LOG.debug("Storescanner.peek() is changed where before = "
             + this.lastTop.toString() + ",and after = " + this.heap.peek());
         this.lastTop = null;
@@ -505,16 +524,21 @@ class StoreScanner extends NonLazyKeyValueScanner
     if (kv == null) {
       kv = lastTopKey;
     }
-    if ((matcher.row == null) || !kv.matchingRow(matcher.row)) {
+    byte[] row = kv.getBuffer();
+    int offset = kv.getRowOffset();
+    short length = kv.getRowLength();
+    if ((matcher.row == null) || !Bytes.equals(row, offset, length, matcher.row, matcher.rowOffset, matcher.rowLength)) {
       matcher.reset();
-      matcher.setRow(kv.getRow());
+      matcher.setRow(row, offset, length);
     }
   }
 
   @Override
   public synchronized boolean reseek(KeyValue kv) throws IOException {
-    //Heap cannot be null, because this is only called from next() which
-    //guarantees that heap will never be null before this call.
+    //Heap will not be null, if this is called from next() which.
+    //If called from RegionScanner.reseek(...) make sure the scanner
+    //stack is reset if needed.
+    checkReseek();
     if (explicitColumnQuery && lazySeekEnabledGlobally) {
       return heap.requestSeek(kv, true, useRowColBloom);
     } else {
@@ -543,15 +567,6 @@ class StoreScanner extends NonLazyKeyValueScanner
 
   static void enableLazySeekGlobally(boolean enable) {
     lazySeekEnabledGlobally = enable;
-  }
-
-  /**
-   * Enum to distinguish general scan types.
-   */
-  public static enum ScanType {
-    MAJOR_COMPACT,
-    MINOR_COMPACT,
-    USER_SCAN
   }
 }
 
