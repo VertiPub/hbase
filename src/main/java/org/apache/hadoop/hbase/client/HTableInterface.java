@@ -22,14 +22,13 @@ package org.apache.hadoop.hbase.client;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.client.coprocessor.Batch;
 import org.apache.hadoop.hbase.ipc.CoprocessorProtocol;
-
-import java.util.Map;
 
 /**
  * Used to communicate with a single HBase table.
@@ -76,12 +75,12 @@ public interface HTableInterface extends Closeable {
   boolean exists(Get get) throws IOException;
 
   /**
-   * Method that does a batch call on Deletes, Gets and Puts. The ordering of
-   * execution of the actions is not defined. Meaning if you do a Put and a
+   * Method that does a batch call on Deletes, Gets, Puts, Increments, Appends and RowMutations.
+   * The execution ordering of the actions is not defined. Meaning if you do a Put and a
    * Get in the same {@link #batch} call, you will not necessarily be
    * guaranteed that the Get returns what the Put had put.
    *
-   * @param actions list of Get, Put, Delete objects
+   * @param actions list of Get, Put, Delete, Increment, Append, RowMutations objects
    * @param results Empty Object[], same size as actions. Provides access to partial
    *                results, in case an exception is thrown. A null in the result array means that
    *                the call for that action failed, even after retries
@@ -94,7 +93,7 @@ public interface HTableInterface extends Closeable {
    * Same as {@link #batch(List, Object[])}, but returns an array of
    * results instead of using a results parameter reference.
    *
-   * @param actions list of Get, Put, Delete objects
+   * @param actions list of Get, Put, Delete, Increment, Append, RowMutations objects
    * @return the results from the actions. A null in the return array means that
    *         the call for that action failed, even after retries
    * @throws IOException
@@ -381,6 +380,7 @@ public interface HTableInterface extends Closeable {
    * @throws IOException if a remote or network exception occurs.
    * @see RowLock
    * @see #unlockRow
+   * @deprecated {@link RowLock} and associated operations are deprecated
    */
   RowLock lockRow(byte[] row) throws IOException;
 
@@ -391,6 +391,7 @@ public interface HTableInterface extends Closeable {
    * @throws IOException if a remote or network exception occurs.
    * @see RowLock
    * @see #unlockRow
+   * @deprecated {@link RowLock} and associated operations are deprecated
    */
   void unlockRow(RowLock rl) throws IOException;
 
@@ -472,4 +473,60 @@ public interface HTableInterface extends Closeable {
       Class<T> protocol, byte[] startKey, byte[] endKey,
       Batch.Call<T,R> callable, Batch.Callback<R> callback)
       throws IOException, Throwable;
+
+  /**
+   * See {@link #setAutoFlush(boolean, boolean)}
+   *
+   * @param autoFlush
+   *          Whether or not to enable 'auto-flush'.
+   */
+  public void setAutoFlush(boolean autoFlush);
+
+  /**
+   * Turns 'auto-flush' on or off.
+   * <p>
+   * When enabled (default), {@link Put} operations don't get buffered/delayed
+   * and are immediately executed. Failed operations are not retried. This is
+   * slower but safer.
+   * <p>
+   * Turning off {@link #autoFlush} means that multiple {@link Put}s will be
+   * accepted before any RPC is actually sent to do the write operations. If the
+   * application dies before pending writes get flushed to HBase, data will be
+   * lost.
+   * <p>
+   * When you turn {@link #autoFlush} off, you should also consider the
+   * {@link #clearBufferOnFail} option. By default, asynchronous {@link Put}
+   * requests will be retried on failure until successful. However, this can
+   * pollute the writeBuffer and slow down batching performance. Additionally,
+   * you may want to issue a number of Put requests and call
+   * {@link #flushCommits()} as a barrier. In both use cases, consider setting
+   * clearBufferOnFail to true to erase the buffer after {@link #flushCommits()}
+   * has been called, regardless of success.
+   *
+   * @param autoFlush
+   *          Whether or not to enable 'auto-flush'.
+   * @param clearBufferOnFail
+   *          Whether to keep Put failures in the writeBuffer
+   * @see #flushCommits
+   */
+  public void setAutoFlush(boolean autoFlush, boolean clearBufferOnFail);
+
+  /**
+   * Returns the maximum size in bytes of the write buffer for this HTable.
+   * <p>
+   * The default value comes from the configuration parameter
+   * {@code hbase.client.write.buffer}.
+   * @return The size of the write buffer in bytes.
+   */
+  public long getWriteBufferSize();
+
+  /**
+   * Sets the size of the buffer in bytes.
+   * <p>
+   * If the new size is less than the current amount of data in the
+   * write buffer, the buffer gets flushed.
+   * @param writeBufferSize The new write buffer size, in bytes.
+   * @throws IOException if a remote or network exception occurs.
+   */
+  public void setWriteBufferSize(long writeBufferSize) throws IOException;
 }

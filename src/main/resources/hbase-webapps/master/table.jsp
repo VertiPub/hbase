@@ -45,6 +45,7 @@
   String tableHeader = "<h2>Table Regions</h2><table><tr><th>Name</th><th>Region Server</th><th>Start Key</th><th>End Key</th><th>Requests</th></tr>";
   ServerName rl = master.getCatalogTracker().getRootLocation();
   boolean showFragmentation = conf.getBoolean("hbase.master.ui.fragmentation.enabled", false);
+  boolean readOnly = conf.getBoolean("hbase.master.ui.readonly", false);
   Map<String, Integer> frags = null;
   if (showFragmentation) {
       frags = FSUtils.getTableFragmentation(master);
@@ -65,7 +66,7 @@
 <%
   String action = request.getParameter("action");
   String key = request.getParameter("key");
-  if ( action != null ) {
+  if ( !readOnly && action != null ) {
 %>
 <head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/>
 <link rel="stylesheet" type="text/css" href="/static/hbase.css" />
@@ -154,6 +155,11 @@
       <td><%= hbadmin.isTableEnabled(table.getTableName()) %></td>
       <td>Is the table enabled</td>
   </tr>
+  <tr>
+      <td>Compaction</td>
+      <td><%= hbadmin.getCompactionState(table.getTableName()) %></td>
+      <td>Is the table compacting</td>
+  </tr>
 <%  if (showFragmentation) { %>
   <tr>
       <td>Fragmentation</td>
@@ -229,9 +235,11 @@
 }
 } // end else
 
-HConnectionManager.deleteConnection(hbadmin.getConfiguration(), false);
+HConnectionManager.deleteConnection(hbadmin.getConfiguration());
 %>
 
+
+<% if (!readOnly) { %>
 <p><hr><p>
 Actions:
 <p>
@@ -268,7 +276,7 @@ Actions:
 </table>
 </center>
 <p>
-
+<% } %>
 <%
 }
 %>

@@ -41,6 +41,7 @@ import org.apache.hadoop.hbase.InvalidFamilyOperationException;
 import org.apache.hadoop.hbase.RemoteExceptionHandler;
 import org.apache.hadoop.hbase.Server;
 import org.apache.hadoop.hbase.ServerName;
+import org.apache.hadoop.hbase.backup.HFileArchiver;
 import org.apache.hadoop.hbase.master.metrics.MasterMetrics;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
@@ -81,7 +82,7 @@ public class MasterFileSystem {
   private final MasterServices services;
 
   public MasterFileSystem(Server master, MasterServices services,
-      MasterMetrics metrics)
+      MasterMetrics metrics, boolean masterRecovery)
   throws IOException {
     this.conf = master.getConfiguration();
     this.master = master;
@@ -98,12 +99,14 @@ public class MasterFileSystem {
     String fsUri = this.fs.getUri().toString();
     conf.set("fs.default.name", fsUri);
     conf.set("fs.defaultFS", fsUri);
+    // make sure the fs has the same conf
+    fs.setConf(conf);
     this.distributedLogSplitting =
       conf.getBoolean("hbase.master.distributed.log.splitting", true);
     if (this.distributedLogSplitting) {
       this.splitLogManager = new SplitLogManager(master.getZooKeeper(),
           master.getConfiguration(), master, master.getServerName().toString());
-      this.splitLogManager.finishInitialization();
+      this.splitLogManager.finishInitialization(masterRecovery);
     } else {
       this.splitLogManager = null;
     }
@@ -183,18 +186,24 @@ public class MasterFileSystem {
   /**
    * Inspect the log directory to recover any log file without
    * an active region server.
-   * @param onlineServers Set of online servers keyed by
-   * {@link ServerName}
    */
-  void splitLogAfterStartup(final Set<ServerName> onlineServers) {
+  void splitLogAfterStartup() {
     boolean retrySplitting = !conf.getBoolean("hbase.hlog.split.skip.errors",
         HLog.SPLIT_SKIP_ERRORS_DEFAULT);
     Path logsDirPath = new Path(this.rootdir, HConstants.HREGION_LOGDIR_NAME);
     do {
+      if (master.isStopped()) {
+        LOG.warn("Master stopped while splitting logs");
+        break;
+      }
       List<ServerName> serverNames = new ArrayList<ServerName>();
       try {
         if (!this.fs.exists(logsDirPath)) return;
         FileStatus[] logFolders = FSUtils.listStatus(this.fs, logsDirPath, null);
+        // Get online servers after getting log folders to avoid log folder deletion of newly
+        // checked in region servers . see HBASE-5916
+        Set<ServerName> onlineServers = ((HMaster) master).getServerManager().getOnlineServers()
+            .keySet();
 
         if (logFolders == null || logFolders.length == 0) {
           LOG.debug("No log files to split, proceeding...");
@@ -238,13 +247,13 @@ public class MasterFileSystem {
       }
     } while (retrySplitting);
   }
-  
+
   public void splitLog(final ServerName serverName) throws IOException {
     List<ServerName> serverNames = new ArrayList<ServerName>();
     serverNames.add(serverName);
     splitLog(serverNames);
   }
-  
+
   public void splitLog(final List<ServerName> serverNames) throws IOException {
     long splitTime = 0, splitLogSize = 0;
     List<Path> logDirs = new ArrayList<Path>();
@@ -270,7 +279,7 @@ public class MasterFileSystem {
       LOG.info("No logs to split");
       return;
     }
-      
+
     if (distributedLogSplitting) {
       splitLogManager.handleDeadWorkers(serverNames);
       splitTime = EnvironmentEdgeManager.currentTimeMillis();
@@ -281,7 +290,7 @@ public class MasterFileSystem {
         // splitLogLock ensures that dead region servers' logs are processed
         // one at a time
         this.splitLogLock.lock();
-        try {              
+        try {
           HLogSplitter splitter = HLogSplitter.createLogSplitter(
             conf, rootdir, logDir, oldLogDir, this.fs);
           try {
@@ -335,7 +344,7 @@ public class MasterFileSystem {
         // there is one datanode it will succeed. Permission problems should have
         // already been caught by mkdirs above.
         FSUtils.setVersion(fs, rd, c.getInt(HConstants.THREAD_WAKE_FREQUENCY,
-          10 * 1000), c.getInt(HConstants.VERSION_FILE_WRITE_ATTEMPTS, 
+          10 * 1000), c.getInt(HConstants.VERSION_FILE_WRITE_ATTEMPTS,
         		  HConstants.DEFAULT_VERSION_FILE_WRITE_ATTEMPTS));
       } else {
         if (!fs.isDirectory(rd)) {
@@ -343,7 +352,7 @@ public class MasterFileSystem {
         }
         // as above
         FSUtils.checkVersion(fs, rd, true, c.getInt(HConstants.THREAD_WAKE_FREQUENCY,
-          10 * 1000), c.getInt(HConstants.VERSION_FILE_WRITE_ATTEMPTS, 
+          10 * 1000), c.getInt(HConstants.VERSION_FILE_WRITE_ATTEMPTS,
         		  HConstants.DEFAULT_VERSION_FILE_WRITE_ATTEMPTS));
       }
     } catch (IllegalArgumentException iae) {
@@ -434,7 +443,7 @@ public class MasterFileSystem {
 
 
   public void deleteRegion(HRegionInfo region) throws IOException {
-    fs.delete(HRegion.getRegionDir(rootdir, region), true);
+    HFileArchiver.archiveRegion(conf, fs, region);
   }
 
   public void deleteTable(byte[] tableName) throws IOException {
@@ -447,6 +456,23 @@ public class MasterFileSystem {
     //      @see HRegion.checkRegioninfoOnFilesystem()
   }
 
+  public void deleteFamilyFromFS(HRegionInfo region, byte[] familyName)
+      throws IOException {
+    // archive family store files
+    Path tableDir = new Path(rootdir, region.getTableNameAsString());
+    HFileArchiver.archiveFamily(fs, conf, region, tableDir, familyName);
+
+    // delete the family folder
+    Path familyDir = new Path(tableDir,
+      new Path(region.getEncodedName(), Bytes.toString(familyName)));
+    if (fs.delete(familyDir, true) == false) {
+      throw new IOException("Could not delete family "
+          + Bytes.toString(familyName) + " from FileSystem for region "
+          + region.getRegionNameAsString() + "(" + region.getEncodedName()
+          + ")");
+    }
+  }
+
   public void stop() {
     if (splitLogManager != null) {
       this.splitLogManager.stop();
@@ -455,7 +481,7 @@ public class MasterFileSystem {
 
   /**
    * Create new HTableDescriptor in HDFS.
-   * 
+   *
    * @param htableDescriptor
    */
   public void createTableDescriptor(HTableDescriptor htableDescriptor)

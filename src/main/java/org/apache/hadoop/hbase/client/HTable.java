@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Collections;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
@@ -49,14 +50,13 @@ import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.client.HConnectionManager.HConnectable;
-import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
 import org.apache.hadoop.hbase.client.coprocessor.Batch;
 import org.apache.hadoop.hbase.ipc.CoprocessorProtocol;
 import org.apache.hadoop.hbase.ipc.ExecRPCInvoker;
 import org.apache.hadoop.hbase.util.Addressing;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
-import org.apache.hadoop.hbase.util.Writables;
+import org.apache.hadoop.hbase.util.Threads;
 
 /**
  * <p>Used to communicate with a single HBase table.
@@ -168,7 +168,7 @@ public class HTable implements HTableInterface {
     this.pool = new ThreadPoolExecutor(1, maxThreads,
         keepAliveTime, TimeUnit.SECONDS,
         new SynchronousQueue<Runnable>(),
-        new DaemonThreadFactory());
+        Threads.newDaemonThreadFactory("hbase-table"));
     ((ThreadPoolExecutor)this.pool).allowCoreThreadTimeOut(true);
 
     this.finishSetup();
@@ -435,28 +435,15 @@ public class HTable implements HTableInterface {
    * @throws IOException if a remote or network exception occurs
    */
   public Pair<byte[][],byte[][]> getStartEndKeys() throws IOException {
-    final List<byte[]> startKeyList = new ArrayList<byte[]>();
-    final List<byte[]> endKeyList = new ArrayList<byte[]>();
-    MetaScannerVisitor visitor = new MetaScannerVisitor() {
-      public boolean processRow(Result rowResult) throws IOException {
-        byte [] bytes = rowResult.getValue(HConstants.CATALOG_FAMILY,
-          HConstants.REGIONINFO_QUALIFIER);
-        if (bytes == null) {
-          LOG.warn("Null " + HConstants.REGIONINFO_QUALIFIER + " cell in " +
-            rowResult);
-          return true;
-        }
-        HRegionInfo info = Writables.getHRegionInfo(bytes);
-        if (Bytes.equals(info.getTableName(), getTableName())) {
-          if (!(info.isOffline() || info.isSplit())) {
-            startKeyList.add(info.getStartKey());
-            endKeyList.add(info.getEndKey());
-          }
-        }
-        return true;
-      }
-    };
-    MetaScanner.metaScan(configuration, visitor, this.tableName);
+    NavigableMap<HRegionInfo, ServerName> regions = getRegionLocations();
+    final List<byte[]> startKeyList = new ArrayList<byte[]>(regions.size());
+    final List<byte[]> endKeyList = new ArrayList<byte[]>(regions.size());
+
+    for (HRegionInfo region : regions.keySet()) {
+      startKeyList.add(region.getStartKey());
+      endKeyList.add(region.getEndKey());
+    }
+
     return new Pair<byte [][], byte [][]>(
       startKeyList.toArray(new byte[startKeyList.size()][]),
       endKeyList.toArray(new byte[endKeyList.size()][]));
@@ -472,32 +459,18 @@ public class HTable implements HTableInterface {
     final Map<HRegionInfo, HServerAddress> regionMap =
       new TreeMap<HRegionInfo, HServerAddress>();
 
-    MetaScannerVisitor visitor = new MetaScannerVisitor() {
-      public boolean processRow(Result rowResult) throws IOException {
-        HRegionInfo info = Writables.getHRegionInfo(
-            rowResult.getValue(HConstants.CATALOG_FAMILY,
-                HConstants.REGIONINFO_QUALIFIER));
+    final Map<HRegionInfo, ServerName> regionLocations = getRegionLocations();
 
-        if (!(Bytes.equals(info.getTableName(), getTableName()))) {
-          return false;
-        }
-
-        HServerAddress server = new HServerAddress();
-        byte [] value = rowResult.getValue(HConstants.CATALOG_FAMILY,
-            HConstants.SERVER_QUALIFIER);
-        if (value != null && value.length > 0) {
-          String hostAndPort = Bytes.toString(value);
-          server = new HServerAddress(Addressing.createInetSocketAddressFromHostAndPortStr(hostAndPort));
-        }
-
-        if (!(info.isOffline() || info.isSplit())) {
-          regionMap.put(new UnmodifyableHRegionInfo(info), server);
-        }
-        return true;
+    for (Map.Entry<HRegionInfo, ServerName> entry : regionLocations.entrySet()) {
+      HServerAddress server = new HServerAddress();
+      ServerName serverName = entry.getValue();
+      if (serverName != null && serverName.getHostAndPort() != null) {
+        server = new HServerAddress(Addressing.createInetSocketAddressFromHostAndPortStr(
+            serverName.getHostAndPort()));
       }
+      regionMap.put(entry.getKey(), server);
+    }
 
-    };
-    MetaScanner.metaScan(configuration, visitor, tableName);
     return regionMap;
   }
 
@@ -715,7 +688,7 @@ public class HTable implements HTableInterface {
    * {@inheritDoc}
    */
   @Override
-  public synchronized void batch(final List<?extends Row> actions, final Object[] results)
+  public void batch(final List<?extends Row> actions, final Object[] results)
       throws InterruptedException, IOException {
     connection.processBatch(actions, tableName, pool, results);
   }
@@ -724,7 +697,7 @@ public class HTable implements HTableInterface {
    * {@inheritDoc}
    */
   @Override
-  public synchronized Object[] batch(final List<? extends Row> actions) throws InterruptedException, IOException {
+  public Object[] batch(final List<? extends Row> actions) throws InterruptedException, IOException {
     Object[] results = new Object[actions.size()];
     connection.processBatch(actions, tableName, pool, results);
     return results;
@@ -1129,35 +1102,6 @@ public class HTable implements HTableInterface {
     return this.pool;
   }
 
-  static class DaemonThreadFactory implements ThreadFactory {
-    static final AtomicInteger poolNumber = new AtomicInteger(1);
-        final ThreadGroup group;
-        final AtomicInteger threadNumber = new AtomicInteger(1);
-        final String namePrefix;
-
-        DaemonThreadFactory() {
-            SecurityManager s = System.getSecurityManager();
-            group = (s != null)? s.getThreadGroup() :
-                                 Thread.currentThread().getThreadGroup();
-            namePrefix = "hbase-table-pool" +
-                          poolNumber.getAndIncrement() +
-                         "-thread-";
-        }
-
-        public Thread newThread(Runnable r) {
-            Thread t = new Thread(group, r,
-                                  namePrefix + threadNumber.getAndIncrement(),
-                                  0);
-            if (!t.isDaemon()) {
-              t.setDaemon(true);
-            }
-            if (t.getPriority() != Thread.NORM_PRIORITY) {
-              t.setPriority(Thread.NORM_PRIORITY);
-            }
-            return t;
-        }
-  }
-
   /**
    * Enable or disable region cache prefetch for the table. It will be
    * applied for the given table's all HTable instances who share the same
@@ -1267,8 +1211,8 @@ public class HTable implements HTableInterface {
       Batch.Call<T,R> callable)
       throws IOException, Throwable {
 
-    final Map<byte[],R> results = new TreeMap<byte[],R>(
-        Bytes.BYTES_COMPARATOR);
+    final Map<byte[],R> results =  Collections.synchronizedMap(new TreeMap<byte[],R>(
+        Bytes.BYTES_COMPARATOR));
     coprocessorExec(protocol, startKey, endKey, callable,
         new Batch.Callback<R>(){
       public void update(byte[] region, byte[] row, R value) {

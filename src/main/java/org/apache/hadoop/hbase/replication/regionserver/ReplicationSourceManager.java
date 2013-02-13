@@ -40,6 +40,7 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.Stoppable;
 import org.apache.hadoop.hbase.replication.ReplicationZookeeper;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperListener;
@@ -79,7 +80,7 @@ public class ReplicationSourceManager {
   // The path to the latest log we saw, for new coming sources
   private Path latestPath;
   // List of all the other region servers in this cluster
-  private final List<String> otherRegionServers;
+  private final List<String> otherRegionServers = new ArrayList<String>();
   // Path to the hlogs directories
   private final Path logDir;
   // Path to the hlog archive
@@ -120,12 +121,9 @@ public class ReplicationSourceManager {
     this.sleepBeforeFailover = conf.getLong("replication.sleep.before.failover", 2000);
     this.zkHelper.registerRegionServerListener(
         new OtherRegionServerWatcher(this.zkHelper.getZookeeperWatcher()));
-    List<String> otherRSs =
-        this.zkHelper.getRegisteredRegionServers();
     this.zkHelper.registerRegionServerListener(
         new PeersWatcher(this.zkHelper.getZookeeperWatcher()));
     this.zkHelper.listPeersIdsAndWatch();
-    this.otherRegionServers = otherRSs == null ? new ArrayList<String>() : otherRSs;
     // It's preferable to failover 1 RS at a time, but with good zk servers
     // more could be processed at the same time.
     int nbWorkers = conf.getInt("replication.executor.workers", 1);
@@ -148,11 +146,16 @@ public class ReplicationSourceManager {
    * @param id id of the peer cluster
    * @param position current location in the log
    * @param queueRecovered indicates if this queue comes from another region server
+   * @param holdLogInZK if true then the log is retained in ZK
    */
-  public void logPositionAndCleanOldLogs(Path log, String id, long position, boolean queueRecovered) {
+  public void logPositionAndCleanOldLogs(Path log, String id, long position, 
+      boolean queueRecovered, boolean holdLogInZK) {
     String key = log.getName();
     LOG.info("Going to report log #" + key + " for position " + position + " in " + log);
     this.zkHelper.writeReplicationStatus(key, id, position);
+    if (holdLogInZK) {
+     return;
+    }
     synchronized (this.hlogsById) {
       SortedSet<String> hlogs = this.hlogsById.get(id);
       if (!queueRecovered && hlogs.first() != key) {
@@ -180,6 +183,7 @@ public class ReplicationSourceManager {
       return;
     }
     synchronized (otherRegionServers) {
+      refreshOtherRegionServersList();
       LOG.info("Current list of replicators: " + currentReplicators
           + " other RSs: " + otherRegionServers);
     }
@@ -253,7 +257,7 @@ public class ReplicationSourceManager {
     return this.sources;
   }
 
-  void logRolled(Path newLog) throws IOException {
+  void preLogRoll(Path newLog) throws IOException {
     if (!this.replicating.get()) {
       LOG.warn("Replication stopped, won't add new log");
       return;
@@ -279,6 +283,14 @@ public class ReplicationSourceManager {
     }
 
     this.latestPath = newLog;
+  }
+
+  void postLogRoll(Path newLog) throws IOException {
+    if (!this.replicating.get()) {
+      LOG.warn("Replication stopped, won't add new log");
+      return;
+    }
+
     // This only updates the sources we own, not the recovered ones
     for (ReplicationSourceInterface source : this.sources) {
       source.enqueueLog(newLog);    
@@ -397,6 +409,27 @@ public class ReplicationSourceManager {
   }
 
   /**
+   * Reads the list of region servers from ZK and atomically clears our
+   * local view of it and replaces it with the updated list.
+   * 
+   * @return true if the local list of the other region servers was updated
+   * with the ZK data (even if it was empty),
+   * false if the data was missing in ZK
+   */
+  private boolean refreshOtherRegionServersList() {
+    List<String> newRsList = zkHelper.getRegisteredRegionServers();
+    if (newRsList == null) {
+      return false;
+    } else {
+      synchronized (otherRegionServers) {
+        otherRegionServers.clear();
+        otherRegionServers.addAll(newRsList);
+      }
+    }
+    return true;
+  }
+
+  /**
    * Watcher used to be notified of the other region server's death
    * in the local cluster. It initiates the process to transfer the queues
    * if it is able to grab the lock.
@@ -415,7 +448,7 @@ public class ReplicationSourceManager {
      * @param path full path of the new node
      */
     public void nodeCreated(String path) {
-      refreshRegionServersList(path);
+      refreshListIfRightPath(path);
     }
 
     /**
@@ -426,7 +459,7 @@ public class ReplicationSourceManager {
       if (stopper.isStopped()) {
         return;
       }
-      boolean cont = refreshRegionServersList(path);
+      boolean cont = refreshListIfRightPath(path);
       if (!cont) {
         return;
       }
@@ -442,23 +475,14 @@ public class ReplicationSourceManager {
       if (stopper.isStopped()) {
         return;
       }
-      refreshRegionServersList(path);
+      refreshListIfRightPath(path);
     }
 
-    private boolean refreshRegionServersList(String path) {
+    private boolean refreshListIfRightPath(String path) {
       if (!path.startsWith(zkHelper.getZookeeperWatcher().rsZNode)) {
         return false;
       }
-      List<String> newRsList = (zkHelper.getRegisteredRegionServers());
-      if (newRsList == null) {
-        return false;
-      } else {
-        synchronized (otherRegionServers) {
-          otherRegionServers.clear();
-          otherRegionServers.addAll(newRsList);
-        }
-      }
-      return true;
+      return refreshOtherRegionServersList();
     }
   }
 
@@ -558,14 +582,22 @@ public class ReplicationSourceManager {
         LOG.info("Not transferring queue since we are shutting down");
         return;
       }
-      if (!zkHelper.lockOtherRS(rsZnode)) {
-        return;
+      SortedMap<String, SortedSet<String>> newQueues = null;
+
+      // check whether there is multi support. If yes, use it.
+      if (conf.getBoolean(HConstants.ZOOKEEPER_USEMULTI, true)) {
+        LOG.info("Atomically moving " + rsZnode + "'s hlogs to my queue");
+        newQueues = zkHelper.copyQueuesFromRSUsingMulti(rsZnode);
+      } else {
+        LOG.info("Moving " + rsZnode + "'s hlogs to my queue");
+        if (!zkHelper.lockOtherRS(rsZnode)) {
+          return;
+        }
+        newQueues = zkHelper.copyQueuesFromRS(rsZnode);
+        zkHelper.deleteRsQueues(rsZnode);
       }
-      LOG.info("Moving " + rsZnode + "'s hlogs to my queue");
-      SortedMap<String, SortedSet<String>> newQueues =
-          zkHelper.copyQueuesFromRS(rsZnode);
-      zkHelper.deleteRsQueues(rsZnode);
-      if (newQueues == null || newQueues.size() == 0) {
+      // process of copying over the failed queue is completed.
+      if (newQueues.size() == 0) {
         return;
       }
 

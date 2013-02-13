@@ -61,12 +61,14 @@ import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.ZooKeeperConnectionException;
 import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
+import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitorBase;
 import org.apache.hadoop.hbase.client.coprocessor.Batch;
 import org.apache.hadoop.hbase.ipc.CoprocessorProtocol;
 import org.apache.hadoop.hbase.ipc.ExecRPCInvoker;
 import org.apache.hadoop.hbase.ipc.HBaseRPC;
 import org.apache.hadoop.hbase.ipc.HMasterInterface;
 import org.apache.hadoop.hbase.ipc.HRegionInterface;
+import org.apache.hadoop.hbase.ipc.RpcEngine;
 import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Addressing;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -75,7 +77,7 @@ import org.apache.hadoop.hbase.util.SoftValueSortedMap;
 import org.apache.hadoop.hbase.util.Writables;
 import org.apache.hadoop.hbase.zookeeper.ClusterId;
 import org.apache.hadoop.hbase.zookeeper.RootRegionTracker;
-import org.apache.hadoop.hbase.zookeeper.ZKTable;
+import org.apache.hadoop.hbase.zookeeper.ZKTableReadOnly;
 import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.hadoop.ipc.RemoteException;
@@ -101,7 +103,7 @@ import org.apache.zookeeper.KeeperException;
  * <p>But sharing connections
  * makes clean up of {@link HConnection} instances a little awkward.  Currently,
  * clients cleanup by calling
- * {@link #deleteConnection(Configuration, boolean)}.  This will shutdown the
+ * {@link #deleteConnection(Configuration)}.  This will shutdown the
  * zookeeper connection the HConnection was using and clean up all
  * HConnection resources as well as stopping proxies to servers out on the
  * cluster. Not running the cleanup will not end the world; it'll
@@ -122,7 +124,7 @@ import org.apache.zookeeper.KeeperException;
  * }
  * </pre>
  * <p>Cleanup used to be done inside in a shutdown hook.  On startup we'd
- * register a shutdown hook that called {@link #deleteAllConnections(boolean)}
+ * register a shutdown hook that called {@link #deleteAllConnections()}
  * on its way out but the order in which shutdown hooks run is not defined so
  * were problematic for clients of HConnection that wanted to register their
  * own shutdown hooks so we removed ours though this shifts the onus for
@@ -181,6 +183,10 @@ public class HConnectionManager {
       if (connection == null) {
         connection = new HConnectionImplementation(conf, true);
         HBASE_INSTANCES.put(connectionKey, connection);
+      } else if (connection.isClosed()) {
+        HConnectionManager.deleteConnection(connectionKey, true);
+        connection = new HConnectionImplementation(conf, true);
+        HBASE_INSTANCES.put(connectionKey, connection);
       }
       connection.incCount();
       return connection;
@@ -211,13 +217,25 @@ public class HConnectionManager {
    *          configuration whose identity is used to find {@link HConnection}
    *          instance.
    * @param stopProxy
-   *          Shuts down all the proxy's put up to cluster members including to
-   *          cluster HMaster. Calls
-   *          {@link HBaseRPC#stopProxy(org.apache.hadoop.hbase.ipc.VersionedProtocol)}
-   *          .
+   *          No longer used.  This parameter is ignored.
+   * @deprecated use {@link #createConnection(org.apache.hadoop.conf.Configuration)} instead
    */
+  @Deprecated
   public static void deleteConnection(Configuration conf, boolean stopProxy) {
-    deleteConnection(new HConnectionKey(conf), stopProxy, false);
+    deleteConnection(conf);
+  }
+
+  /**
+   * Delete connection information for the instance specified by configuration.
+   * If there are no more references to it, this will then close connection to
+   * the zookeeper ensemble and let go of all resources.
+   *
+   * @param conf
+   *          configuration whose identity is used to find {@link HConnection}
+   *          instance.
+   */
+  public static void deleteConnection(Configuration conf) {
+    deleteConnection(new HConnectionKey(conf), false);
   }
 
   /**
@@ -228,32 +246,40 @@ public class HConnectionManager {
    * @param connection
    */
   public static void deleteStaleConnection(HConnection connection) {
-    deleteConnection(connection, true, true);
+    deleteConnection(connection, true);
   }
 
   /**
    * Delete information for all connections.
-   * @param stopProxy stop the proxy as well
+   * @param stopProxy No longer used.  This parameter is ignored.
+   * @deprecated use {@link #deleteAllConnections()} instead
+   */
+  @Deprecated
+  public static void deleteAllConnections(boolean stopProxy) {
+    deleteAllConnections();
+  }
+
+  /**
+   * Delete information for all connections.
    * @throws IOException
    */
-  public static void deleteAllConnections(boolean stopProxy) {
+  public static void deleteAllConnections() {
     synchronized (HBASE_INSTANCES) {
       Set<HConnectionKey> connectionKeys = new HashSet<HConnectionKey>();
       connectionKeys.addAll(HBASE_INSTANCES.keySet());
       for (HConnectionKey connectionKey : connectionKeys) {
-        deleteConnection(connectionKey, stopProxy, false);
+        deleteConnection(connectionKey, false);
       }
       HBASE_INSTANCES.clear();
     }
   }
 
-  private static void deleteConnection(HConnection connection, boolean stopProxy,
-      boolean staleConnection) {
+  private static void deleteConnection(HConnection connection, boolean staleConnection) {
     synchronized (HBASE_INSTANCES) {
       for (Entry<HConnectionKey, HConnectionImplementation> connectionEntry : HBASE_INSTANCES
           .entrySet()) {
         if (connectionEntry.getValue() == connection) {
-          deleteConnection(connectionEntry.getKey(), stopProxy, staleConnection);
+          deleteConnection(connectionEntry.getKey(), staleConnection);
           break;
         }
       }
@@ -261,7 +287,7 @@ public class HConnectionManager {
   }
 
   private static void deleteConnection(HConnectionKey connectionKey,
-      boolean stopProxy, boolean staleConnection) {
+      boolean staleConnection) {
     synchronized (HBASE_INSTANCES) {
       HConnectionImplementation connection = HBASE_INSTANCES
           .get(connectionKey);
@@ -269,9 +295,7 @@ public class HConnectionManager {
         connection.decCount();
         if (connection.isZeroReference() || staleConnection) {
           HBASE_INSTANCES.remove(connectionKey);
-          connection.close(stopProxy);
-        } else if (stopProxy) {
-          connection.stopProxyOnClose(stopProxy);
+          connection.internalClose();
         }
       }else {
         LOG.error("Connection not found in the list, can't delete it "+
@@ -380,7 +404,7 @@ public class HConnectionManager {
    * added to the {@link HConnectionKey#properties} list.
    *
    */
-  static class HConnectionKey {
+  public static class HConnectionKey {
     public static String[] CONNECTION_PROPERTIES = new String[] {
         HConstants.ZOOKEEPER_QUORUM, HConstants.ZOOKEEPER_ZNODE_PARENT,
         HConstants.ZOOKEEPER_CLIENT_PORT,
@@ -493,8 +517,8 @@ public class HConnectionManager {
     private final Object masterLock = new Object();
     private volatile boolean closed;
     private volatile boolean aborted;
+    private volatile boolean resetting;
     private volatile HMasterInterface master;
-    private volatile boolean masterChecked;
     // ZooKeeper reference
     private volatile ZooKeeperWatcher zooKeeper;
     // ZooKeeper-based master address tracker
@@ -505,8 +529,13 @@ public class HConnectionManager {
     private final Object metaRegionLock = new Object();
 
     private final Object userRegionLock = new Object();
+	
+    private final Object resetLock = new Object();
 
     private final Configuration conf;
+
+    private RpcEngine rpcEngine;
+
     // Known region HServerAddress.toString() -> HRegionInterface
 
     private final Map<String, HRegionInterface> servers =
@@ -534,7 +563,6 @@ public class HConnectionManager {
     private final Set<Integer> regionCachePrefetchDisabledTables =
       new CopyOnWriteArraySet<Integer>();
 
-    private boolean stopProxy;
     private int refCount;
 
     // indicates whether this connection's life cycle is managed
@@ -573,7 +601,7 @@ public class HConnectionManager {
           HConstants.DEFAULT_HBASE_CLIENT_PREFETCH_LIMIT);
 
       this.master = null;
-      this.masterChecked = false;
+      this.resetting = false;
     }
 
     private synchronized void ensureZookeeperTrackers()
@@ -584,6 +612,9 @@ public class HConnectionManager {
       }
       if (clusterId == null) {
         clusterId = new ClusterId(zooKeeper, this);
+        if (clusterId.hasId()) {
+          conf.set(HConstants.CLUSTER_ID, clusterId.getId());
+        }
       }
       if (masterAddressTracker == null) {
         masterAddressTracker = new MasterAddressTracker(zooKeeper, this);
@@ -592,6 +623,10 @@ public class HConnectionManager {
       if (rootRegionTracker == null) {
         rootRegionTracker = new RootRegionTracker(zooKeeper, this);
         rootRegionTracker.start();
+      }
+      // RpcEngine needs access to zookeeper data, like cluster ID
+      if (rpcEngine == null) {
+        this.rpcEngine = HBaseRPC.getProtocolEngine(conf);
       }
     }
 
@@ -615,6 +650,23 @@ public class HConnectionManager {
       return this.conf;
     }
 
+    /**
+     * Log failure of getMaster attempt
+     * @return true if should retry
+     */
+    private boolean shouldRetryGetMaster(int tries, Exception e) {
+      if (tries == numRetries - 1) {
+        // This was our last chance - don't bother sleeping
+        LOG.info("getMaster attempt " + tries + " of " + numRetries +
+          " failed; no more retrying.", e);
+        return false;
+      }
+      LOG.info("getMaster attempt " + tries + " of " + numRetries +
+        " failed; retrying after sleep of " +
+        ConnectionUtils.getPauseTime(this.pause, tries), e);
+      return true;
+    }
+
     public HMasterInterface getMaster()
     throws MasterNotRunningException, ZooKeeperConnectionException {
       // TODO: REMOVE.  MOVE TO HBaseAdmin and redo as a Callable!!!
@@ -633,12 +685,18 @@ public class HConnectionManager {
       checkIfBaseNodeAvailable();
       ServerName sn = null;
       synchronized (this.masterLock) {
+        try {
+          if (master != null && master.isMasterRunning()) {
+            return master;
+          }
+        } catch (UndeclaredThrowableException ute) {
+          // log, but ignore, the loop below will attempt to reconnect
+          LOG.info("Exception contacting master. Retrying...", ute.getCause());
+        }
         this.master = null;
 
         for (int tries = 0;
-          !this.closed &&
-          !this.masterChecked && this.master == null &&
-          tries < numRetries;
+          !this.closed && this.master == null && tries < numRetries;
         tries++) {
 
           try {
@@ -648,12 +706,9 @@ public class HConnectionManager {
               throw new MasterNotRunningException();
             }
 
-            if (clusterId.hasId()) {
-              conf.set(HConstants.CLUSTER_ID, clusterId.getId());
-            }
             InetSocketAddress isa =
               new InetSocketAddress(sn.getHostname(), sn.getPort());
-            HMasterInterface tryMaster = (HMasterInterface)HBaseRPC.getProxy(
+            HMasterInterface tryMaster = rpcEngine.getProxy(
                 HMasterInterface.class, HMasterInterface.VERSION, isa, this.conf,
                 this.rpcTimeout);
 
@@ -664,15 +719,9 @@ public class HConnectionManager {
             }
 
           } catch (IOException e) {
-            if (tries == numRetries - 1) {
-              // This was our last chance - don't bother sleeping
-              LOG.info("getMaster attempt " + tries + " of " + numRetries +
-                " failed; no more retrying.", e);
-              break;
-            }
-            LOG.info("getMaster attempt " + tries + " of " + numRetries +
-              " failed; retrying after sleep of " +
-              ConnectionUtils.getPauseTime(this.pause, tries), e);
+            if (!shouldRetryGetMaster(tries, e)) break;
+          } catch (UndeclaredThrowableException ute) {
+            if (!shouldRetryGetMaster(tries, ute)) break;
           }
 
           // Cannot connect to master or it is not running. Sleep & retry
@@ -683,10 +732,6 @@ public class HConnectionManager {
             throw new RuntimeException("Thread was interrupted while trying to connect to master.");
           }
         }
-        // Avoid re-checking in the future if this is a managed HConnection,
-        // even if we failed to acquire a master.
-        // (this is to retain the existing behavior before HBASE-5058)
-        this.masterChecked = managed;
 
         if (this.master == null) {
           if (sn == null) {
@@ -736,7 +781,7 @@ public class HConnectionManager {
     public boolean isTableAvailable(final byte[] tableName) throws IOException {
       final AtomicBoolean available = new AtomicBoolean(true);
       final AtomicInteger regionCount = new AtomicInteger(0);
-      MetaScannerVisitor visitor = new MetaScannerVisitor() {
+      MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
         @Override
         public boolean processRow(Result row) throws IOException {
           byte[] value = row.getValue(HConstants.CATALOG_FAMILY,
@@ -769,13 +814,13 @@ public class HConnectionManager {
         // The root region is always enabled
         return online;
       }
-      getZooKeeperWatcher();
+      ZooKeeperWatcher zkw = getZooKeeperWatcher();
       String tableNameStr = Bytes.toString(tableName);
       try {
         if (online) {
-          return ZKTable.isEnabledTable(this.zooKeeper, tableNameStr);
+          return ZKTableReadOnly.isEnabledTable(zkw, tableNameStr);
         }
-        return ZKTable.isDisabledTable(this.zooKeeper, tableNameStr);
+        return ZKTableReadOnly.isDisabledTable(zkw, tableNameStr);
       } catch (KeeperException e) {
         throw new IOException("Enable/Disable failed", e);
       }
@@ -798,17 +843,25 @@ public class HConnectionManager {
     public HRegionLocation locateRegion(final byte [] tableName,
         final byte [] row)
     throws IOException{
-      return locateRegion(tableName, row, true);
+      return locateRegion(tableName, row, true, true);
     }
 
     public HRegionLocation relocateRegion(final byte [] tableName,
         final byte [] row)
     throws IOException{
-      return locateRegion(tableName, row, false);
+
+      // Since this is an explicit request not to use any caching, finding
+      // disabled tables should not be desirable.  This will ensure that an exception is thrown when
+      // the first time a disabled table is interacted with.
+      if (isTableDisabled(tableName)) {
+        throw new DoNotRetryIOException(Bytes.toString(tableName) + " is disabled.");
+      }
+
+      return locateRegion(tableName, row, false, true);
     }
 
     private HRegionLocation locateRegion(final byte [] tableName,
-      final byte [] row, boolean useCache)
+      final byte [] row, boolean useCache, boolean retry)
     throws IOException {
       if (this.closed) throw new IOException(toString() + " closed");
       if (tableName == null || tableName.length == 0) {
@@ -818,7 +871,7 @@ public class HConnectionManager {
       ensureZookeeperTrackers();
       if (Bytes.equals(tableName, HConstants.ROOT_TABLE_NAME)) {
         try {
-          ServerName servername = this.rootRegionTracker.getRootRegionLocation();
+          ServerName servername = this.rootRegionTracker.waitRootRegionLocation(this.rpcTimeout);
           LOG.debug("Looked up root region location, connection=" + this +
             "; serverName=" + ((servername == null)? "": servername.toString()));
           if (servername == null) return null;
@@ -830,11 +883,11 @@ public class HConnectionManager {
         }
       } else if (Bytes.equals(tableName, HConstants.META_TABLE_NAME)) {
         return locateRegionInMeta(HConstants.ROOT_TABLE_NAME, tableName, row,
-            useCache, metaRegionLock);
+            useCache, metaRegionLock, retry);
       } else {
         // Region not in the cache - have to go to the meta RS
         return locateRegionInMeta(HConstants.META_TABLE_NAME, tableName, row,
-            useCache, userRegionLock);
+            useCache, userRegionLock, retry);
       }
     }
 
@@ -847,7 +900,7 @@ public class HConnectionManager {
         final byte[] row) {
       // Implement a new visitor for MetaScanner, and use it to walk through
       // the .META.
-      MetaScannerVisitor visitor = new MetaScannerVisitor() {
+      MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
         public boolean processRow(Result result) throws IOException {
           try {
             byte[] value = result.getValue(HConstants.CATALOG_FAMILY,
@@ -904,7 +957,7 @@ public class HConnectionManager {
       */
     private HRegionLocation locateRegionInMeta(final byte [] parentTable,
       final byte [] tableName, final byte [] row, boolean useCache,
-      Object regionLockObject)
+      Object regionLockObject, boolean retry)
     throws IOException {
       HRegionLocation location;
       // If we are supposed to be using the cache, look in the cache to see if
@@ -916,13 +969,14 @@ public class HConnectionManager {
         }
       }
 
+      int localNumRetries = retry ? numRetries : 1;
       // build the key of the meta region we should be looking for.
       // the extra 9's on the end are necessary to allow "exact" matches
       // without knowing the precise region names.
       byte [] metaKey = HRegionInfo.createRegionName(tableName, row,
         HConstants.NINES, false);
       for (int tries = 0; true; tries++) {
-        if (tries >= numRetries) {
+        if (tries >= localNumRetries) {
           throw new NoServerForRegionException("Unable to find region for "
             + Bytes.toStringBinary(row) + " after " + numRetries + " tries.");
         }
@@ -930,7 +984,7 @@ public class HConnectionManager {
         HRegionLocation metaLocation = null;
         try {
           // locate the root or meta region
-          metaLocation = locateRegion(parentTable, metaKey);
+          metaLocation = locateRegion(parentTable, metaKey, true, false);
           // If null still, go around again.
           if (metaLocation == null) continue;
           HRegionInterface server =
@@ -1274,14 +1328,11 @@ public class HConnectionManager {
           server = this.servers.get(rsName);
           if (server == null) {
             try {
-              if (clusterId.hasId()) {
-                conf.set(HConstants.CLUSTER_ID, clusterId.getId());
-              }
               // Only create isa when we need to.
               InetSocketAddress address = isa != null? isa:
                 new InetSocketAddress(hostname, port);
               // definitely a cache miss. establish an RPC for this RS
-              server = (HRegionInterface) HBaseRPC.waitForProxy(
+              server = HBaseRPC.waitForProxy(this.rpcEngine,
                   serverInterfaceClass, HRegionInterface.VERSION,
                   address, this.conf,
                   this.maxRPCAttempts, this.rpcTimeout, this.rpcTimeout);
@@ -1479,7 +1530,7 @@ public class HConnectionManager {
         for (int i = 0; i < workingList.size(); i++) {
           Row row = workingList.get(i);
           if (row != null) {
-            HRegionLocation loc = locateRegion(tableName, row.getRow(), true);
+            HRegionLocation loc = locateRegion(tableName, row.getRow());
             byte[] regionName = loc.getRegionInfo().getRegionName();
 
             MultiAction<R> actions = actionsByServer.get(loc);
@@ -1657,7 +1708,12 @@ public class HConnectionManager {
           LOG.info("ZK session expired. This disconnect could have been" +
               " caused by a network partition or a long-running GC pause," +
               " either way it's recommended that you verify your environment.");
+          synchronized (resetLock) {
+            if (resetting) return;
+            this.resetting = true;
+          }
           resetZooKeeperTrackers();
+          this.resetting = false;
         }
         return;
       }
@@ -1679,18 +1735,14 @@ public class HConnectionManager {
 
     public int getCurrentNrHRS() throws IOException {
       try {
-        getZooKeeperWatcher();
+        ZooKeeperWatcher zkw = getZooKeeperWatcher();
         // We go to zk rather than to master to get count of regions to avoid
         // HTable having a Master dependency.  See HBase-2828
-        return ZKUtil.getNumberOfChildren(this.zooKeeper,
-            this.zooKeeper.rsZNode);
+        return ZKUtil.getNumberOfChildren(zkw,
+            zkw.rsZNode);
       } catch (KeeperException ke) {
         throw new IOException("Unexpected ZooKeeper exception", ke);
       }
-    }
-
-    public void stopProxyOnClose(boolean stopProxy) {
-      this.stopProxy = stopProxy;
     }
 
     /**
@@ -1718,23 +1770,17 @@ public class HConnectionManager {
       return refCount == 0;
     }
 
-    void close(boolean stopProxy) {
+    void internalClose() {
       if (this.closed) {
         return;
       }
-      if (master != null) {
-        if (stopProxy) {
-          HBaseRPC.stopProxy(master);
-        }
-        master = null;
-        masterChecked = false;
-      }
-      if (stopProxy) {
-        for (HRegionInterface i : servers.values()) {
-          HBaseRPC.stopProxy(i);
-        }
-      }
+      master = null;
+
       this.servers.clear();
+      if (this.rpcEngine != null) {
+        this.rpcEngine.close();
+      }
+
       if (this.zooKeeper != null) {
         LOG.info("Closed zookeeper sessionid=0x" +
           Long.toHexString(this.zooKeeper.getRecoverableZooKeeper().getSessionId()));
@@ -1746,20 +1792,24 @@ public class HConnectionManager {
 
     public void close() {
       if (managed) {
-        HConnectionManager.deleteConnection((HConnection)this, stopProxy, false);
+        if (aborted) {
+          HConnectionManager.deleteStaleConnection(this);
+        } else {
+          HConnectionManager.deleteConnection(this, false);
+        }
       } else {
-        close(true);
+        internalClose();
       }
       if (LOG.isTraceEnabled()) LOG.debug("" + this.zooKeeper + " closed.");
     }
 
     /**
      * Close the connection for good, regardless of what the current value of
-     * {@link #refCount} is. Ideally, {@link refCount} should be zero at this
+     * {@link #refCount} is. Ideally, {@link #refCount} should be zero at this
      * point, which would be the case if all of its consumers close the
      * connection. However, on the off chance that someone is unable to close
      * the connection, perhaps because it bailed out prematurely, the method
-     * below will ensure that this {@link Connection} instance is cleaned up.
+     * below will ensure that this {@link HConnection} instance is cleaned up.
      * Caveat: The JVM may take an unknown amount of time to call finalize on an
      * unreachable object, so our hope is that every consumer cleans up after
      * itself, like any good citizen.
@@ -1802,20 +1852,16 @@ public class HConnectionManager {
       if (this.master == null) {
         this.master = getMaster();
       }
-      HTableDescriptor hTableDescriptor = null;
+
       HTableDescriptor[] htds = master.getHTableDescriptors();
       if (htds != null && htds.length > 0) {
         for (HTableDescriptor htd: htds) {
           if (Bytes.equals(tableName, htd.getName())) {
-            hTableDescriptor = htd;
+            return htd;
           }
         }
       }
-      //HTableDescriptor htd = master.getHTableDescriptor(tableName);
-      if (hTableDescriptor == null) {
-        throw new TableNotFoundException(Bytes.toString(tableName));
-      }
-      return hTableDescriptor;
+      throw new TableNotFoundException(Bytes.toString(tableName));
     }
   }
 

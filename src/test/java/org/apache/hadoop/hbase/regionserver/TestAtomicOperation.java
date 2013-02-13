@@ -255,7 +255,7 @@ public class TestAtomicOperation extends HBaseTestCase {
     LOG.info("Starting test testRowMutationMultiThreads");
     initHRegion(tableName, getName(), fam1);
 
-    // create 100 threads, each will alternate between adding and
+    // create 10 threads, each will alternate between adding and
     // removing a column
     int numThreads = 10;
     int opsPerThread = 500;
@@ -276,6 +276,9 @@ public class TestAtomicOperation extends HBaseTestCase {
                 synchronized(region) {
                   LOG.debug("flushing");
                   region.flushcache();
+                  if (i%100==0) {
+                    region.compactStores();
+                  }
                 }
               }
               long ts = timeStamps.incrementAndGet();
@@ -339,10 +342,10 @@ public class TestAtomicOperation extends HBaseTestCase {
     LOG.info("Starting test testMultiRowMutationMultiThreads");
     initHRegion(tableName, getName(), fam1);
 
-    // create 100 threads, each will alternate between adding and
+    // create 10 threads, each will alternate between adding and
     // removing a column
     int numThreads = 10;
-    int opsPerThread = 1000;
+    int opsPerThread = 500;
     AtomicOperation[] all = new AtomicOperation[numThreads];
 
     AtomicLong timeStamps = new AtomicLong(0);
@@ -361,6 +364,9 @@ public class TestAtomicOperation extends HBaseTestCase {
                 synchronized(region) {
                   LOG.debug("flushing");
                   region.flushcache();
+                  if (i%100==0) {
+                    region.compactStores();
+                  }
                 }
               }
               long ts = timeStamps.incrementAndGet();

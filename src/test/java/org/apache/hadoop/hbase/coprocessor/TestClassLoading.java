@@ -33,7 +33,6 @@ import org.apache.hadoop.fs.Path;
 import javax.tools.*;
 import java.io.*;
 import java.util.*;
-import java.util.Arrays;
 import java.util.jar.*;
 
 import org.junit.*;
@@ -51,7 +50,6 @@ public class TestClassLoading {
   private static final Log LOG = LogFactory.getLog(TestClassLoading.class);
   private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
 
-  private static Configuration conf;
   private static MiniDFSCluster cluster;
 
   static final int BUFFER_SIZE = 4096;
@@ -61,28 +59,22 @@ public class TestClassLoading {
   static final String cpName3 = "TestCP3";
   static final String cpName4 = "TestCP4";
   static final String cpName5 = "TestCP5";
+  static final String cpName6 = "TestCP6";
+  static final String cpNameInvalid = "TestCPInvalid";
 
-  private static Class regionCoprocessor1 = ColumnAggregationEndpoint.class;
-  private static Class regionCoprocessor2 = GenericEndpoint.class;
-  private static Class regionServerCoprocessor = SampleRegionWALObserver.class;
-  private static Class masterCoprocessor = BaseMasterObserver.class;
+  private static Class<?> regionCoprocessor1 = ColumnAggregationEndpoint.class;
+  private static Class<?> regionCoprocessor2 = GenericEndpoint.class;
+  private static Class<?> regionServerCoprocessor = SampleRegionWALObserver.class;
+  private static Class<?> masterCoprocessor = BaseMasterObserver.class;
 
   private static final String[] regionServerSystemCoprocessors =
       new String[]{
-      regionCoprocessor1.getSimpleName(),
-      regionServerCoprocessor.getSimpleName()
-  };
-
-  private static final String[] regionServerSystemAndUserCoprocessors =
-      new String[] {
-      regionCoprocessor1.getSimpleName(),
-      regionCoprocessor2.getSimpleName(),
       regionServerCoprocessor.getSimpleName()
   };
 
   @BeforeClass
   public static void setUpBeforeClass() throws Exception {
-    conf = TEST_UTIL.getConfiguration();
+    Configuration conf = TEST_UTIL.getConfiguration();
 
     // regionCoprocessor1 will be loaded on all regionservers, since it is
     // loaded for any tables (user or meta).
@@ -174,7 +166,7 @@ public class TestClassLoading {
     // the classpath is {hbaseSrc}/target/classes.
     String currentDir = new File(".").getAbsolutePath();
     String classpath =
-        currentDir + Path.SEPARATOR + "target"+ Path.SEPARATOR + "classes" +
+        currentDir + File.separator + "target"+ File.separator + "classes" +
         System.getProperty("path.separator") +
         System.getProperty("surefire.test.class.path");
     options.add(classpath);
@@ -208,16 +200,18 @@ public class TestClassLoading {
       new Path(fs.getUri().toString() + Path.SEPARATOR));
     String jarFileOnHDFS1 = fs.getUri().toString() + Path.SEPARATOR +
       jarFile1.getName();
+    Path pathOnHDFS1 = new Path(jarFileOnHDFS1);
     assertTrue("Copy jar file to HDFS failed.",
-      fs.exists(new Path(jarFileOnHDFS1)));
+      fs.exists(pathOnHDFS1));
     LOG.info("Copied jar file to HDFS: " + jarFileOnHDFS1);
 
     fs.copyFromLocalFile(new Path(jarFile2.getPath()),
         new Path(fs.getUri().toString() + Path.SEPARATOR));
     String jarFileOnHDFS2 = fs.getUri().toString() + Path.SEPARATOR +
       jarFile2.getName();
+    Path pathOnHDFS2 = new Path(jarFileOnHDFS2);
     assertTrue("Copy jar file to HDFS failed.",
-      fs.exists(new Path(jarFileOnHDFS2)));
+      fs.exists(pathOnHDFS2));
     LOG.info("Copied jar file to HDFS: " + jarFileOnHDFS2);
 
     // create a table that references the coprocessors
@@ -229,40 +223,82 @@ public class TestClassLoading {
       // with configuration values
     htd.setValue("COPROCESSOR$2", jarFileOnHDFS2.toString() + "|" + cpName2 +
       "|" + Coprocessor.PRIORITY_USER + "|k1=v1,k2=v2,k3=v3");
-    HBaseAdmin admin = new HBaseAdmin(this.conf);
+    // same jar but invalid class name (should fail to load this class)
+    htd.setValue("COPROCESSOR$3", jarFileOnHDFS2.toString() + "|" + cpNameInvalid +
+      "|" + Coprocessor.PRIORITY_USER);
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
     if (admin.tableExists(tableName)) {
       admin.disableTable(tableName);
       admin.deleteTable(tableName);
     }
-    admin.createTable(htd);
+    CoprocessorHost.classLoadersCache.clear();
+    byte[] startKey = {10, 63};
+    byte[] endKey = {12, 43};
+    admin.createTable(htd, startKey, endKey, 4);
+    waitForTable(htd.getName());
 
     // verify that the coprocessors were loaded
-    boolean found1 = false, found2 = false, found2_k1 = false,
-        found2_k2 = false, found2_k3 = false;
+    boolean foundTableRegion=false;
+    boolean found_invalid = true, found1 = true, found2 = true, found2_k1 = true,
+        found2_k2 = true, found2_k3 = true;
+    Map<HRegion, Set<ClassLoader>> regionsActiveClassLoaders =
+        new HashMap<HRegion, Set<ClassLoader>>();
     MiniHBaseCluster hbase = TEST_UTIL.getHBaseCluster();
     for (HRegion region:
         hbase.getRegionServer(0).getOnlineRegionsLocalContext()) {
       if (region.getRegionNameAsString().startsWith(tableName)) {
+        foundTableRegion = true;
         CoprocessorEnvironment env;
         env = region.getCoprocessorHost().findCoprocessorEnvironment(cpName1);
-        if (env != null) {
-          found1 = true;
-        }
+        found1 = found1 && (env != null);
         env = region.getCoprocessorHost().findCoprocessorEnvironment(cpName2);
+        found2 = found2 && (env != null);
         if (env != null) {
-          found2 = true;
           Configuration conf = env.getConfiguration();
-          found2_k1 = conf.get("k1") != null;
-          found2_k2 = conf.get("k2") != null;
-          found2_k3 = conf.get("k3") != null;
+          found2_k1 = found2_k1 && (conf.get("k1") != null);
+          found2_k2 = found2_k2 && (conf.get("k2") != null);
+          found2_k3 = found2_k3 && (conf.get("k3") != null);
+        } else {
+          found2_k1 = found2_k2 = found2_k3 = false;
         }
+        env = region.getCoprocessorHost().findCoprocessorEnvironment(cpNameInvalid);
+        found_invalid = found_invalid && (env != null);
+
+        regionsActiveClassLoaders
+            .put(region, ((CoprocessorHost) region.getCoprocessorHost()).getExternalClassLoaders());
       }
     }
+
+    assertTrue("No region was found for table " + tableName, foundTableRegion);
     assertTrue("Class " + cpName1 + " was missing on a region", found1);
     assertTrue("Class " + cpName2 + " was missing on a region", found2);
+    //an invalid CP class name is defined for this table, validate that it is not loaded
+    assertFalse("Class " + cpNameInvalid + " was found on a region", found_invalid);
     assertTrue("Configuration key 'k1' was missing on a region", found2_k1);
     assertTrue("Configuration key 'k2' was missing on a region", found2_k2);
     assertTrue("Configuration key 'k3' was missing on a region", found2_k3);
+    // check if CP classloaders are cached
+    assertTrue(jarFileOnHDFS1 + " was not cached",
+      CoprocessorHost.classLoadersCache.containsKey(pathOnHDFS1));
+    assertTrue(jarFileOnHDFS2 + " was not cached",
+      CoprocessorHost.classLoadersCache.containsKey(pathOnHDFS2));
+    //two external jar used, should be one classloader per jar
+    assertEquals("The number of cached classloaders should be equal to the number" +
+      " of external jar files",
+      2, CoprocessorHost.classLoadersCache.size());
+    //check if region active classloaders are shared across all RS regions
+    Set<ClassLoader> externalClassLoaders = new HashSet<ClassLoader>(
+        CoprocessorHost.classLoadersCache.values());
+    for (Map.Entry<HRegion, Set<ClassLoader>> regionCP : regionsActiveClassLoaders.entrySet()) {
+      assertTrue("Some CP classloaders for region " + regionCP.getKey() + " are not cached."
+            + " ClassLoader Cache:" + externalClassLoaders
+            + " Region ClassLoaders:" + regionCP.getValue(),
+            externalClassLoaders.containsAll(regionCP.getValue()));
+    }
+  }
+
+  private String getLocalPath(File file) {
+    return new Path(file.toURI()).toString();
   }
 
   @Test
@@ -273,10 +309,11 @@ public class TestClassLoading {
     // create a table that references the jar
     HTableDescriptor htd = new HTableDescriptor(cpName3);
     htd.addFamily(new HColumnDescriptor("test"));
-    htd.setValue("COPROCESSOR$1", jarFile.toString() + "|" + cpName3 + "|" +
+    htd.setValue("COPROCESSOR$1", getLocalPath(jarFile) + "|" + cpName3 + "|" +
       Coprocessor.PRIORITY_USER);
-    HBaseAdmin admin = new HBaseAdmin(this.conf);
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
     admin.createTable(htd);
+    waitForTable(htd.getName());
 
     // verify that the coprocessor was loaded
     boolean found = false;
@@ -291,6 +328,37 @@ public class TestClassLoading {
   }
 
   @Test
+  // HBASE-6308: Test CP classloader is the CoprocessorClassLoader
+  public void testPrivateClassLoader() throws Exception {
+    File jarFile = buildCoprocessorJar(cpName4);
+
+    // create a table that references the jar
+    HTableDescriptor htd = new HTableDescriptor(cpName4);
+    htd.addFamily(new HColumnDescriptor("test"));
+    htd.setValue("COPROCESSOR$1", getLocalPath(jarFile) + "|" + cpName4 + "|" +
+      Coprocessor.PRIORITY_USER);
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
+    admin.createTable(htd);
+    waitForTable(htd.getName());
+
+    // verify that the coprocessor was loaded correctly
+    boolean found = false;
+    MiniHBaseCluster hbase = TEST_UTIL.getHBaseCluster();
+    for (HRegion region:
+        hbase.getRegionServer(0).getOnlineRegionsLocalContext()) {
+      if (region.getRegionNameAsString().startsWith(cpName4)) {
+        Coprocessor cp = region.getCoprocessorHost().findCoprocessor(cpName4);
+        if (cp != null) {
+          found = true;
+          assertEquals("Class " + cpName4 + " was not loaded by CoprocessorClassLoader",
+            cp.getClass().getClassLoader().getClass(), CoprocessorClassLoader.class);
+        }
+      }
+    }
+    assertTrue("Class " + cpName4 + " was missing on a region", found);
+  }
+
+  @Test
   // HBase-3810: Registering a Coprocessor at HTableDescriptor should be
   // less strict
   public void testHBase3810() throws Exception {
@@ -298,16 +366,16 @@ public class TestClassLoading {
 
     File jarFile1 = buildCoprocessorJar(cpName1);
     File jarFile2 = buildCoprocessorJar(cpName2);
-    File jarFile4 = buildCoprocessorJar(cpName4);
     File jarFile5 = buildCoprocessorJar(cpName5);
+    File jarFile6 = buildCoprocessorJar(cpName6);
 
     String cpKey1 = "COPROCESSOR$1";
     String cpKey2 = " Coprocessor$2 ";
     String cpKey3 = " coprocessor$03 ";
 
-    String cpValue1 = jarFile1.toString() + "|" + cpName1 + "|" +
+    String cpValue1 = getLocalPath(jarFile1) + "|" + cpName1 + "|" +
         Coprocessor.PRIORITY_USER;
-    String cpValue2 = jarFile2.toString() + " | " + cpName2 + " | ";
+    String cpValue2 = getLocalPath(jarFile2) + " | " + cpName2 + " | ";
     // load from default class loader
     String cpValue3 =
         " | org.apache.hadoop.hbase.coprocessor.SimpleRegionObserver | | k=v ";
@@ -322,27 +390,28 @@ public class TestClassLoading {
     htd.setValue(cpKey3, cpValue3);
 
     // add 2 coprocessor by using new htd.addCoprocessor() api
-    htd.addCoprocessor(cpName4, new Path(jarFile4.getPath()),
+    htd.addCoprocessor(cpName5, new Path(getLocalPath(jarFile5)),
         Coprocessor.PRIORITY_USER, null);
     Map<String, String> kvs = new HashMap<String, String>();
     kvs.put("k1", "v1");
     kvs.put("k2", "v2");
     kvs.put("k3", "v3");
-    htd.addCoprocessor(cpName5, new Path(jarFile5.getPath()),
+    htd.addCoprocessor(cpName6, new Path(getLocalPath(jarFile6)),
         Coprocessor.PRIORITY_USER, kvs);
 
-    HBaseAdmin admin = new HBaseAdmin(this.conf);
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
     if (admin.tableExists(tableName)) {
       admin.disableTable(tableName);
       admin.deleteTable(tableName);
     }
     admin.createTable(htd);
+    waitForTable(htd.getName());
 
     // verify that the coprocessor was loaded
     boolean found_2 = false, found_1 = false, found_3 = false,
-        found_4 = false, found_5 = false;
-    boolean found5_k1 = false, found5_k2 = false, found5_k3 = false,
-        found5_k4 = false;
+        found_5 = false, found_6 = false;
+    boolean found6_k1 = false, found6_k2 = false, found6_k3 = false,
+        found6_k4 = false;
 
     MiniHBaseCluster hbase = TEST_UTIL.getHBaseCluster();
     for (HRegion region:
@@ -355,17 +424,17 @@ public class TestClassLoading {
         found_3 = found_3 ||
             (region.getCoprocessorHost().findCoprocessor("SimpleRegionObserver")
                 != null);
-        found_4 = found_4 ||
-            (region.getCoprocessorHost().findCoprocessor(cpName4) != null);
+        found_5 = found_5 ||
+            (region.getCoprocessorHost().findCoprocessor(cpName5) != null);
 
         CoprocessorEnvironment env =
-            region.getCoprocessorHost().findCoprocessorEnvironment(cpName5);
+            region.getCoprocessorHost().findCoprocessorEnvironment(cpName6);
         if (env != null) {
-          found_5 = true;
+          found_6 = true;
           Configuration conf = env.getConfiguration();
-          found5_k1 = conf.get("k1") != null;
-          found5_k2 = conf.get("k2") != null;
-          found5_k3 = conf.get("k3") != null;
+          found6_k1 = conf.get("k1") != null;
+          found6_k2 = conf.get("k2") != null;
+          found6_k3 = conf.get("k3") != null;
         }
       }
     }
@@ -373,13 +442,13 @@ public class TestClassLoading {
     assertTrue("Class " + cpName1 + " was missing on a region", found_1);
     assertTrue("Class " + cpName2 + " was missing on a region", found_2);
     assertTrue("Class SimpleRegionObserver was missing on a region", found_3);
-    assertTrue("Class " + cpName4 + " was missing on a region", found_4);
     assertTrue("Class " + cpName5 + " was missing on a region", found_5);
+    assertTrue("Class " + cpName6 + " was missing on a region", found_6);
 
-    assertTrue("Configuration key 'k1' was missing on a region", found5_k1);
-    assertTrue("Configuration key 'k2' was missing on a region", found5_k2);
-    assertTrue("Configuration key 'k3' was missing on a region", found5_k3);
-    assertFalse("Configuration key 'k4' wasn't configured", found5_k4);
+    assertTrue("Configuration key 'k1' was missing on a region", found6_k1);
+    assertTrue("Configuration key 'k2' was missing on a region", found6_k2);
+    assertTrue("Configuration key 'k3' was missing on a region", found6_k3);
+    assertFalse("Configuration key 'k4' wasn't configured", found6_k4);
   }
 
   @Test
@@ -391,6 +460,8 @@ public class TestClassLoading {
     File outerJarFile = new File(TEST_UTIL.getDataTestDir().toString(), "outer.jar");
 
     byte buffer[] = new byte[BUFFER_SIZE];
+    // TODO: code here and elsewhere in this file is duplicated w/TestClassFinder.
+    //       Some refactoring may be in order...
     // Open archive file
     FileOutputStream stream = new FileOutputStream(outerJarFile);
     JarOutputStream out = new JarOutputStream(stream, new Manifest());
@@ -400,7 +471,7 @@ public class TestClassLoading {
       JarEntry jarAdd = new JarEntry("/lib/" + jarFile.getName());
       jarAdd.setTime(jarFile.lastModified());
       out.putNextEntry(jarAdd);
-  
+
       // Write file to archive
       FileInputStream in = new FileInputStream(jarFile);
       while (true) {
@@ -433,12 +504,13 @@ public class TestClassLoading {
       // with configuration values
     htd.setValue("COPROCESSOR$2", jarFileOnHDFS.toString() + "|" + cpName2 +
       "|" + Coprocessor.PRIORITY_USER + "|k1=v1,k2=v2,k3=v3");
-    HBaseAdmin admin = new HBaseAdmin(this.conf);
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
     if (admin.tableExists(tableName)) {
       admin.disableTable(tableName);
       admin.deleteTable(tableName);
     }
     admin.createTable(htd);
+    waitForTable(htd.getName());
 
     // verify that the coprocessors were loaded
     boolean found1 = false, found2 = false, found2_k1 = false,
@@ -471,79 +543,12 @@ public class TestClassLoading {
 
   @Test
   public void testRegionServerCoprocessorsReported() throws Exception {
-    // HBASE 4070: Improve region server metrics to report loaded coprocessors
-    // to master: verify that each regionserver is reporting the correct set of
-    // loaded coprocessors.
+    // This was a test for HBASE-4070.
+    // We are removing coprocessors from region load in HBASE-5258.
+    // Therefore, this test now only checks system coprocessors.
 
-    // We rely on the fact that getCoprocessors() will return a sorted
-    // display of the coprocessors' names, so for example, regionCoprocessor1's
-    // name "ColumnAggregationEndpoint" will appear before regionCoprocessor2's
-    // name "GenericEndpoint" because "C" is before "G" lexicographically.
-
-    HBaseAdmin admin = new HBaseAdmin(this.conf);
-
-    // disable all user tables, if any are loaded.
-    for (HTableDescriptor htd: admin.listTables()) {
-      if (!htd.isMetaTable()) {
-        String tableName = htd.getNameAsString();
-        if (admin.isTableEnabled(tableName)) {
-          try {
-            admin.disableTable(htd.getNameAsString());
-          } catch (TableNotEnabledException e) {
-            // ignoring this exception for now : not sure why it's happening.
-          }
-        }
-      }
-    }
-
-    // should only be system coprocessors loaded at this point.
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
     assertAllRegionServers(regionServerSystemCoprocessors,null);
-
-    // The next two tests enable and disable user tables to see if coprocessor
-    // load reporting changes as coprocessors are loaded and unloaded.
-    //
-
-    // Create a table.
-    // should cause regionCoprocessor2 to be loaded, since we've specified it
-    // for loading on any user table with USER_REGION_COPROCESSOR_CONF_KEY
-    // in setUpBeforeClass().
-    String userTable1 = "userTable1";
-    HTableDescriptor userTD1 = new HTableDescriptor(userTable1);
-    admin.createTable(userTD1);
-    // table should be enabled now.
-    assertTrue(admin.isTableEnabled(userTable1));
-    assertAllRegionServers(regionServerSystemAndUserCoprocessors, userTable1);
-
-    // unload and make sure we're back to only system coprocessors again.
-    admin.disableTable(userTable1);
-    assertAllRegionServers(regionServerSystemCoprocessors,null);
-
-    // create another table, with its own specified coprocessor.
-    String userTable2 = "userTable2";
-    HTableDescriptor htd2 = new HTableDescriptor(userTable2);
-
-    String userTableCP = "userTableCP";
-    File jarFile1 = buildCoprocessorJar(userTableCP);
-    htd2.addFamily(new HColumnDescriptor("myfamily"));
-    htd2.setValue("COPROCESSOR$1", jarFile1.toString() + "|" + userTableCP +
-      "|" + Coprocessor.PRIORITY_USER);
-    admin.createTable(htd2);
-    // table should be enabled now.
-    assertTrue(admin.isTableEnabled(userTable2));
-
-    ArrayList<String> existingCPsPlusNew =
-        new ArrayList<String>(Arrays.asList(regionServerSystemAndUserCoprocessors));
-    existingCPsPlusNew.add(userTableCP);
-    String[] existingCPsPlusNewArray = new String[existingCPsPlusNew.size()];
-    assertAllRegionServers(existingCPsPlusNew.toArray(existingCPsPlusNewArray),
-        userTable2);
-
-    admin.disableTable(userTable2);
-    assertTrue(admin.isTableDisabled(userTable2));
-
-    // we should be back to only system coprocessors again.
-    assertAllRegionServers(regionServerSystemCoprocessors, null);
-
   }
 
   /**
@@ -590,7 +595,7 @@ public class TestClassLoading {
       }
       boolean any_failed = false;
       for(Map.Entry<ServerName,HServerLoad> server: servers.entrySet()) {
-        actualCoprocessors = server.getValue().getCoprocessors();
+        actualCoprocessors = server.getValue().getRsCoprocessors();
         if (!Arrays.equals(actualCoprocessors, expectedCoprocessors)) {
           LOG.debug("failed comparison: actual: " +
               Arrays.toString(actualCoprocessors) +
@@ -620,6 +625,13 @@ public class TestClassLoading {
         java.util.Arrays.toString(
             TEST_UTIL.getHBaseCluster().getMaster().getCoprocessors());
     assertEquals(loadedMasterCoprocessorsVerify, loadedMasterCoprocessors);
+  }
+
+  private void waitForTable(byte[] name) throws InterruptedException, IOException {
+    // First wait until all regions are online
+    TEST_UTIL.waitTableEnabled(name, 5000);
+    // Now wait a bit longer for the coprocessor hosts to load the CPs
+    Thread.sleep(1000);
   }
 
   @org.junit.Rule

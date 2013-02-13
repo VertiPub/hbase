@@ -33,8 +33,6 @@ import org.apache.hadoop.hbase.regionserver.DeleteTracker.DeleteResult;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 
-import org.apache.hadoop.hbase.regionserver.StoreScanner.ScanType;
-
 /**
  * A query matcher that is specifically designed for the scan case.
  */
@@ -84,6 +82,8 @@ public class ScanQueryMatcher {
   /* row is not private for tests */
   /** Row the query is on */
   byte [] row;
+  int rowOffset;
+  short rowLength;
   
   /**
    * Oldest put in any of the involved store files
@@ -136,7 +136,7 @@ public class ScanQueryMatcher {
    *  based on TTL
    */
   public ScanQueryMatcher(Scan scan, Store.ScanInfo scanInfo,
-      NavigableSet<byte[]> columns, StoreScanner.ScanType scanType,
+      NavigableSet<byte[]> columns, ScanType scanType,
       long readPointToUse, long earliestPutTs, long oldestUnexpiredTS) {
     this.tr = scan.getTimeRange();
     this.rowComparator = scanInfo.getComparator().getRawComparator();
@@ -183,7 +183,7 @@ public class ScanQueryMatcher {
    */
   ScanQueryMatcher(Scan scan, Store.ScanInfo scanInfo,
       NavigableSet<byte[]> columns, long oldestUnexpiredTS) {
-    this(scan, scanInfo, columns, StoreScanner.ScanType.USER_SCAN,
+    this(scan, scanInfo, columns, ScanType.USER_SCAN,
           Long.MAX_VALUE, /* max Readpoint to track versions */
         HConstants.LATEST_TIMESTAMP, oldestUnexpiredTS);
   }
@@ -224,7 +224,7 @@ public class ScanQueryMatcher {
     short rowLength = Bytes.toShort(bytes, offset, Bytes.SIZEOF_SHORT);
     offset += Bytes.SIZEOF_SHORT;
 
-    int ret = this.rowComparator.compareRows(row, 0, row.length,
+    int ret = this.rowComparator.compareRows(row, this.rowOffset, this.rowLength,
         bytes, offset, rowLength);
     if (ret <= -1) {
       return MatchCode.DONE;
@@ -291,10 +291,9 @@ public class ScanQueryMatcher {
         }
         // Can't early out now, because DelFam come before any other keys
       }
-      if (retainDeletesInOutput ||
-          (!isUserScan &&
-              (EnvironmentEdgeManager.currentTimeMillis() - timestamp) <= 
-              timeToPurgeDeletes)) {
+      if (retainDeletesInOutput
+          || (!isUserScan && (EnvironmentEdgeManager.currentTimeMillis() - timestamp) <= timeToPurgeDeletes)
+          || kv.getMemstoreTS() > maxReadPointToTrackVersions) {
         // always include or it is not time yet to check whether it is OK
         // to purge deltes or not
         return MatchCode.INCLUDE;
@@ -340,8 +339,9 @@ public class ScanQueryMatcher {
      * counter for even that KV which may be discarded later on by Filter. This
      * would lead to incorrect results in certain cases.
      */
+    ReturnCode filterResponse = ReturnCode.SKIP;
     if (filter != null) {
-      ReturnCode filterResponse = filter.filterKeyValue(kv);
+      filterResponse = filter.filterKeyValue(kv);
       if (filterResponse == ReturnCode.SKIP) {
         return MatchCode.SKIP;
       } else if (filterResponse == ReturnCode.NEXT_COL) {
@@ -363,6 +363,9 @@ public class ScanQueryMatcher {
      */
     if (colChecker == MatchCode.SEEK_NEXT_ROW) {
       stickyNextRow = true;
+    } else if (filter != null && colChecker == MatchCode.INCLUDE &&
+               filterResponse == ReturnCode.INCLUDE_AND_NEXT_COL) {
+      return MatchCode.INCLUDE_AND_SEEK_NEXT_COL;
     }
     return colChecker;
 
@@ -384,8 +387,10 @@ public class ScanQueryMatcher {
    * Set current row
    * @param row
    */
-  public void setRow(byte [] row) {
+  public void setRow(byte [] row, int offset, short length) {
     this.row = row;
+    this.rowOffset = offset;
+    this.rowLength = length;
     reset();
   }
 

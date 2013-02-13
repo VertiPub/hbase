@@ -21,12 +21,10 @@
 package org.apache.hadoop.hbase.rest;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
 import java.util.Map;
 
 import javax.ws.rs.GET;
 import javax.ws.rs.Produces;
-import javax.ws.rs.WebApplicationException;
 import javax.ws.rs.core.CacheControl;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.Response;
@@ -37,13 +35,12 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
 import org.apache.hadoop.hbase.HRegionInfo;
-import org.apache.hadoop.hbase.HServerAddress;
+import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableNotFoundException;
-import org.apache.hadoop.hbase.client.HTable;
-import org.apache.hadoop.hbase.client.HTableInterface;
-import org.apache.hadoop.hbase.client.HTablePool;
+import org.apache.hadoop.hbase.client.MetaScanner;
 import org.apache.hadoop.hbase.rest.model.TableInfoModel;
 import org.apache.hadoop.hbase.rest.model.TableRegionModel;
+import org.apache.hadoop.hbase.util.Bytes;
 
 public class RegionsResource extends ResourceBase {
   private static final Log LOG = LogFactory.getLog(RegionsResource.class);
@@ -67,19 +64,9 @@ public class RegionsResource extends ResourceBase {
     this.tableResource = tableResource;
   }
 
-  private Map<HRegionInfo,HServerAddress> getTableRegions()
-      throws IOException {
-    HTablePool pool = servlet.getTablePool();
-    HTableInterface table = pool.getTable(tableResource.getName());
-    try {
-      return ((HTable)table).getRegionsInfo();
-    } finally {
-      pool.putTable(table);
-    }
-  }
-
   @GET
-  @Produces({MIMETYPE_TEXT, MIMETYPE_XML, MIMETYPE_JSON, MIMETYPE_PROTOBUF})
+  @Produces({MIMETYPE_TEXT, MIMETYPE_XML, MIMETYPE_JSON, MIMETYPE_PROTOBUF,
+    MIMETYPE_PROTOBUF_IETF})
   public Response get(final @Context UriInfo uriInfo) {
     if (LOG.isDebugEnabled()) {
       LOG.debug("GET " + uriInfo.getAbsolutePath());
@@ -88,15 +75,14 @@ public class RegionsResource extends ResourceBase {
     try {
       String tableName = tableResource.getName();
       TableInfoModel model = new TableInfoModel(tableName);
-      Map<HRegionInfo,HServerAddress> regions = getTableRegions();
-      for (Map.Entry<HRegionInfo,HServerAddress> e: regions.entrySet()) {
+      Map<HRegionInfo,ServerName> regions = MetaScanner.allTableRegions(
+        servlet.getConfiguration(), Bytes.toBytes(tableName), false);
+      for (Map.Entry<HRegionInfo,ServerName> e: regions.entrySet()) {
         HRegionInfo hri = e.getKey();
-        HServerAddress addr = e.getValue();
-        InetSocketAddress sa = addr.getInetSocketAddress();
+        ServerName addr = e.getValue();
         model.add(
           new TableRegionModel(tableName, hri.getRegionId(),
-            hri.getStartKey(), hri.getEndKey(),
-            sa.getHostName() + ":" + Integer.valueOf(sa.getPort())));
+            hri.getStartKey(), hri.getEndKey(), addr.getHostAndPort()));
       }
       ResponseBuilder response = Response.ok(model);
       response.cacheControl(cacheControl);
@@ -104,11 +90,14 @@ public class RegionsResource extends ResourceBase {
       return response.build();
     } catch (TableNotFoundException e) {
       servlet.getMetrics().incrementFailedGetRequests(1);
-      throw new WebApplicationException(Response.Status.NOT_FOUND);
+      return Response.status(Response.Status.NOT_FOUND)
+        .type(MIMETYPE_TEXT).entity("Not found" + CRLF)
+        .build();
     } catch (IOException e) {
       servlet.getMetrics().incrementFailedGetRequests(1);
-      throw new WebApplicationException(e,
-                  Response.Status.SERVICE_UNAVAILABLE);
+      return Response.status(Response.Status.SERVICE_UNAVAILABLE)
+        .type(MIMETYPE_TEXT).entity("Unavailable" + CRLF)
+        .build();
     }
   }
 }

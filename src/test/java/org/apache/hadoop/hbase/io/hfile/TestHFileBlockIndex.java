@@ -216,7 +216,9 @@ public class TestHFileBlockIndex {
   private void writeWholeIndex() throws IOException {
     assertEquals(0, keys.size());
     HFileBlock.Writer hbw = new HFileBlock.Writer(compr, null,
-        includesMemstoreTS, HFile.DEFAULT_CHECKSUM_TYPE,
+        includesMemstoreTS,
+        1,
+        HFile.DEFAULT_CHECKSUM_TYPE,
         HFile.DEFAULT_BYTES_PER_CHECKSUM);
     FSDataOutputStream outputStream = fs.create(path);
     HFileBlockIndex.BlockIndexWriter biw =
@@ -380,8 +382,8 @@ public class TestHFileBlockIndex {
       // Now test we can get the offset and the on-disk-size using a
       // higher-level API function.s
       boolean locateBlockResult =
-        BlockIndexReader.locateNonRootIndexEntry(nonRootIndex, arrayHoldingKey,
-            searchKey.length / 2, searchKey.length, Bytes.BYTES_RAWCOMPARATOR);
+        (BlockIndexReader.locateNonRootIndexEntry(nonRootIndex, arrayHoldingKey,
+            searchKey.length / 2, searchKey.length, Bytes.BYTES_RAWCOMPARATOR) != -1);
 
       if (i == 0) {
         assertFalse(locateBlockResult);

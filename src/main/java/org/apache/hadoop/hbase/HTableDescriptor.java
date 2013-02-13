@@ -22,19 +22,20 @@ package org.apache.hadoop.hbase;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.regex.Matcher;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
-import org.apache.hadoop.hbase.io.hfile.Compression;
-import org.apache.hadoop.hbase.regionserver.StoreFile;
 import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.io.WritableComparable;
@@ -589,20 +590,21 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
 
   /** 
    * Returns the maximum size upto which a region can grow to after which a region
-   * split is triggered. The region size is represented by the size of the biggest 
+   * split is triggered. The region size is represented by the size of the biggest
    * store file in that region.
-   * 
-   * @return max hregion size for table
-   * 
+   *
+   * @return max hregion size for table, -1 if not set.
+   *
    * @see #setMaxFileSize(long)
    */
   public long getMaxFileSize() {
     byte [] value = getValue(MAX_FILESIZE_KEY);
-    if (value != null)
-      return Long.valueOf(Bytes.toString(value)).longValue();
-    return HConstants.DEFAULT_MAX_FILE_SIZE;
+    if (value != null) {
+      return Long.parseLong(Bytes.toString(value));
+    }
+    return -1;
   }
-  
+
   /**
    * Sets the maximum size upto which a region can grow to after which a region
    * split is triggered. The region size is represented by the size of the biggest 
@@ -624,16 +626,17 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
 
   /**
    * Returns the size of the memstore after which a flush to filesystem is triggered.
-   * 
-   * @return memory cache flush size for each hregion
-   * 
+   *
+   * @return memory cache flush size for each hregion, -1 if not set.
+   *
    * @see #setMemStoreFlushSize(long)
    */
   public long getMemStoreFlushSize() {
     byte [] value = getValue(MEMSTORE_FLUSHSIZE_KEY);
-    if (value != null)
-      return Long.valueOf(Bytes.toString(value)).longValue();
-    return DEFAULT_MEMSTORE_FLUSH_SIZE;
+    if (value != null) {
+      return Long.parseLong(Bytes.toString(value));
+    }
+    return -1;
   }
 
   /**
@@ -1032,10 +1035,10 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
     setValue(key, value);
   }
 
-  
+
   /**
    * Check if the table has an attached co-processor represented by the name className
-   * 
+   *
    * @param className - Class name of the co-processor
    * @return true of the table has a co-processor className
    */
@@ -1063,6 +1066,30 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
       }
     }
     return false;
+  }
+
+  /**
+   * Return the list of attached co-processor represented by their name className
+   *
+   * @return The list of co-processors classNames
+   */
+  public List<String> getCoprocessors() {
+    List<String> result = new ArrayList<String>();
+    Matcher keyMatcher;
+    Matcher valueMatcher;
+    for (Map.Entry<ImmutableBytesWritable, ImmutableBytesWritable> e : this.values.entrySet()) {
+      keyMatcher = HConstants.CP_HTD_ATTR_KEY_PATTERN.matcher(Bytes.toString(e.getKey().get()));
+      if (!keyMatcher.matches()) {
+        continue;
+      }
+      valueMatcher = HConstants.CP_HTD_ATTR_VALUE_PATTERN.matcher(Bytes
+          .toString(e.getValue().get()));
+      if (!valueMatcher.matches()) {
+        continue;
+      }
+      result.add(valueMatcher.group(2).trim()); // classname is the 2nd field
+    }
+    return result;
   }
 
   /**
@@ -1134,11 +1161,13 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
               .setScope(HConstants.REPLICATION_SCOPE_LOCAL)
       });
 
+  @Deprecated
   public void setOwner(User owner) {
     setOwnerString(owner != null ? owner.getShortName() : null);
   }
 
   // used by admin.rb:alter(table_name,*args) to update owner.
+  @Deprecated
   public void setOwnerString(String ownerString) {
     if (ownerString != null) {
       setValue(OWNER_KEY, Bytes.toBytes(ownerString));
@@ -1147,12 +1176,14 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
     }
   }
 
+  @Deprecated
   public String getOwnerString() {
     if (getValue(OWNER_KEY) != null) {
       return Bytes.toString(getValue(OWNER_KEY));
     }
     // Note that every table should have an owner (i.e. should have OWNER_KEY set).
-    // .META. and -ROOT- should return system user as owner, not null (see MasterFileSystem.java:bootstrap()).
+    // .META. and -ROOT- should return system user as owner, not null (see
+    // MasterFileSystem.java:bootstrap()).
     return null;
   }
 }

@@ -19,7 +19,10 @@
  */
 package org.apache.hadoop.hbase.regionserver;
 
+import java.io.IOException;
 import java.util.concurrent.Executors;
+import java.util.Iterator;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
@@ -47,13 +50,6 @@ public class CompactSplitThread implements CompactionRequestor {
   private final ThreadPoolExecutor largeCompactions;
   private final ThreadPoolExecutor smallCompactions;
   private final ThreadPoolExecutor splits;
-  private final long throttleSize;
-
-  /* The default priority for user-specified compaction requests.
-   * The user gets top priority unless we have blocking compactions. (Pri <= 0)
-   */
-  public static final int PRIORITY_USER = 1;
-  public static final int NO_PRIORITY = Integer.MIN_VALUE;
 
   /**
    * Splitting should not take place if the total number of regions exceed this.
@@ -74,22 +70,11 @@ public class CompactSplitThread implements CompactionRequestor {
         "hbase.regionserver.thread.compaction.large", 1));
     int smallThreads = conf.getInt(
         "hbase.regionserver.thread.compaction.small", 1);
-    if (conf.get("hbase.regionserver.thread.compaction.throttle") != null) {
-      throttleSize = conf.getLong(
-          "hbase.regionserver.thread.compaction.throttle", 0);
-    } else {
-      // we have a complicated default. see HBASE-3877
-      long flushSize = conf.getLong(HConstants.HREGION_MEMSTORE_FLUSH_SIZE,
-          HTableDescriptor.DEFAULT_MEMSTORE_FLUSH_SIZE);
-      long splitSize = conf.getLong(HConstants.HREGION_MAX_FILESIZE,
-          HConstants.DEFAULT_MAX_FILE_SIZE);
-      throttleSize = Math.min(flushSize * 2, splitSize / 2);
-    }
 
     int splitThreads = conf.getInt("hbase.regionserver.thread.split", 1);
 
     // if we have throttle threads, make sure the user also specified size
-    Preconditions.checkArgument(smallThreads == 0 || throttleSize > 0);
+    Preconditions.checkArgument(largeThreads > 0 && smallThreads > 0);
 
     final String n = Thread.currentThread().getName();
 
@@ -105,22 +90,18 @@ public class CompactSplitThread implements CompactionRequestor {
       });
     this.largeCompactions
         .setRejectedExecutionHandler(new CompactionRequest.Rejection());
-    if (smallThreads <= 0) {
-      this.smallCompactions = null;
-    } else {
-      this.smallCompactions = new ThreadPoolExecutor(smallThreads, smallThreads,
-          60, TimeUnit.SECONDS, new PriorityBlockingQueue<Runnable>(),
-          new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable r) {
-              Thread t = new Thread(r);
-              t.setName(n + "-smallCompactions-" + System.currentTimeMillis());
-              return t;
-            }
-        });
-      this.smallCompactions
-          .setRejectedExecutionHandler(new CompactionRequest.Rejection());
-    }
+    this.smallCompactions = new ThreadPoolExecutor(smallThreads, smallThreads,
+        60, TimeUnit.SECONDS, new PriorityBlockingQueue<Runnable>(),
+        new ThreadFactory() {
+          @Override
+          public Thread newThread(Runnable r) {
+            Thread t = new Thread(r);
+            t.setName(n + "-smallCompactions-" + System.currentTimeMillis());
+            return t;
+          }
+      });
+    this.smallCompactions
+        .setRejectedExecutionHandler(new CompactionRequest.Rejection());
     this.splits = (ThreadPoolExecutor)
         Executors.newFixedThreadPool(splitThreads,
             new ThreadFactory() {
@@ -135,17 +116,49 @@ public class CompactSplitThread implements CompactionRequestor {
 
   @Override
   public String toString() {
-    return "compaction_queue="
-        + (smallCompactions != null ? "("
-            + largeCompactions.getQueue().size() + ":"
-            + smallCompactions.getQueue().size() + ")"
-            : largeCompactions.getQueue().size())
+    return "compaction_queue=("
+        + largeCompactions.getQueue().size() + ":"
+        + smallCompactions.getQueue().size() + ")"
         + ", split_queue=" + splits.getQueue().size();
+  }
+
+  public String dumpQueue() {
+    StringBuffer queueLists = new StringBuffer();
+    queueLists.append("Compaction/Split Queue dump:\n");
+    queueLists.append("  LargeCompation Queue:\n");
+    BlockingQueue<Runnable> lq = largeCompactions.getQueue();
+    Iterator it = lq.iterator();
+    while(it.hasNext()){
+      queueLists.append("    "+it.next().toString());
+      queueLists.append("\n");
+    }
+    
+    if( smallCompactions != null ){
+      queueLists.append("\n");
+      queueLists.append("  SmallCompation Queue:\n");
+      lq = smallCompactions.getQueue();
+      it = lq.iterator();
+      while(it.hasNext()){
+        queueLists.append("    "+it.next().toString());
+        queueLists.append("\n");
+      }
+    }
+    
+    queueLists.append("\n");
+    queueLists.append("  Split Queue:\n");
+    lq = splits.getQueue();
+    it = lq.iterator();
+    while(it.hasNext()){
+      queueLists.append("    "+it.next().toString());
+      queueLists.append("\n");
+    }
+    
+    return queueLists.toString();
   }
 
   public synchronized boolean requestSplit(final HRegion r) {
     // don't split regions that are blocking
-    if (shouldSplitRegion() && r.getCompactPriority() >= PRIORITY_USER) {
+    if (shouldSplitRegion() && r.getCompactPriority() >= Store.PRIORITY_USER) {
       byte[] midKey = r.checkSplit();
       if (midKey != null) {
         requestSplit(r, midKey);
@@ -172,19 +185,19 @@ public class CompactSplitThread implements CompactionRequestor {
   }
 
   public synchronized void requestCompaction(final HRegion r,
-      final String why) {
+      final String why) throws IOException {
     for(Store s : r.getStores().values()) {
-      requestCompaction(r, s, why, NO_PRIORITY);
+      requestCompaction(r, s, why, Store.NO_PRIORITY);
     }
   }
 
   public synchronized void requestCompaction(final HRegion r, final Store s,
-      final String why) {
-    requestCompaction(r, s, why, NO_PRIORITY);
+      final String why) throws IOException {
+    requestCompaction(r, s, why, Store.NO_PRIORITY);
   }
 
   public synchronized void requestCompaction(final HRegion r, final String why,
-      int p) {
+      int p) throws IOException {
     for(Store s : r.getStores().values()) {
       requestCompaction(r, s, why, p);
     }
@@ -197,30 +210,29 @@ public class CompactSplitThread implements CompactionRequestor {
    * @param priority override the default priority (NO_PRIORITY == decide)
    */
   public synchronized void requestCompaction(final HRegion r, final Store s,
-      final String why, int priority) {
+      final String why, int priority) throws IOException {
     if (this.server.isStopped()) {
       return;
     }
-    CompactionRequest cr = s.requestCompaction();
+    CompactionRequest cr = s.requestCompaction(priority);
     if (cr != null) {
       cr.setServer(server);
-      if (priority != NO_PRIORITY) {
+      if (priority != Store.NO_PRIORITY) {
         cr.setPriority(priority);
       }
-      ThreadPoolExecutor pool = largeCompactions;
-      if (smallCompactions != null && throttleSize > cr.getSize()) {
-        // smallCompactions is like the 10 items or less line at Walmart
-        pool = smallCompactions;
-      }
+      ThreadPoolExecutor pool = s.throttleCompaction(cr.getSize())
+          ? largeCompactions : smallCompactions;
       pool.execute(cr);
       if (LOG.isDebugEnabled()) {
-        String type = "";
-        if (smallCompactions != null) {
-          type = (pool == smallCompactions) ? "Small " : "Large ";
-        }
+        String type = (pool == smallCompactions) ? "Small " : "Large ";
         LOG.debug(type + "Compaction requested: " + cr
             + (why != null && !why.isEmpty() ? "; Because: " + why : "")
             + "; " + this);
+      }
+    } else {
+      if(LOG.isDebugEnabled()) {
+        LOG.debug("Not compacting " + r.getRegionNameAsString() + 
+            " because compaction request was cancelled");
       }
     }
   }
@@ -231,8 +243,7 @@ public class CompactSplitThread implements CompactionRequestor {
   void interruptIfNecessary() {
     splits.shutdown();
     largeCompactions.shutdown();
-    if (smallCompactions != null)
-      smallCompactions.shutdown();
+    smallCompactions.shutdown();
   }
 
   private void waitFor(ThreadPoolExecutor t, String name) {
@@ -241,6 +252,9 @@ public class CompactSplitThread implements CompactionRequestor {
       try {
         done = t.awaitTermination(60, TimeUnit.SECONDS);
         LOG.debug("Waiting for " + name + " to finish...");
+        if (!done) {
+          t.shutdownNow();
+        }
       } catch (InterruptedException ie) {
         LOG.debug("Interrupted waiting for " + name + " to finish...");
       }
@@ -250,9 +264,7 @@ public class CompactSplitThread implements CompactionRequestor {
   void join() {
     waitFor(splits, "Split Thread");
     waitFor(largeCompactions, "Large Compaction Thread");
-    if (smallCompactions != null) {
-      waitFor(smallCompactions, "Small Compaction Thread");
-    }
+    waitFor(smallCompactions, "Small Compaction Thread");
   }
 
   /**
@@ -262,10 +274,7 @@ public class CompactSplitThread implements CompactionRequestor {
    * @return The current size of the regions queue.
    */
   public int getCompactionQueueSize() {
-    int size = largeCompactions.getQueue().size();
-    if (smallCompactions != null)
-      size += smallCompactions.getQueue().size();
-    return size;
+    return largeCompactions.getQueue().size() + smallCompactions.getQueue().size();
   }
 
   private boolean shouldSplitRegion() {

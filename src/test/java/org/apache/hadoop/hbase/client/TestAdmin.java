@@ -40,6 +40,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.*;
+import org.apache.hadoop.hbase.catalog.CatalogTracker;
 import org.apache.hadoop.hbase.executor.EventHandler;
 import org.apache.hadoop.hbase.executor.EventHandler.EventType;
 import org.apache.hadoop.hbase.executor.ExecutorService;
@@ -49,7 +50,8 @@ import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.regionserver.wal.HLogUtilsForTests;
 import org.apache.hadoop.hbase.InvalidFamilyOperationException;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.zookeeper.ZKTable;
+import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.hbase.zookeeper.ZKTableReadOnly;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.junit.*;
 import org.junit.experimental.categories.Category;
@@ -234,9 +236,7 @@ public class TestAdmin {
     boolean ok = false;
     try {
       ht.get(get);
-    } catch (NotServingRegionException e) {
-      ok = true;
-    } catch (RetriesExhaustedException e) {
+    } catch (DoNotRetryIOException e) {
       ok = true;
     }
     assertTrue(ok);
@@ -282,23 +282,22 @@ public class TestAdmin {
     try {
       ht1.get(get);
       ht2.get(get);
-    } catch (NotServingRegionException e) {
-      ok = true;
-    } catch (RetriesExhaustedException e) {
+    } catch (DoNotRetryIOException e) {
       ok = true;
     }
+
     assertTrue(ok);
     this.admin.enableTables("testDisableAndEnableTable.*");
 
     // Test that tables are enabled
     try {
       ht1.get(get);
-    } catch (RetriesExhaustedException e) {
+    } catch (IOException e) {
       ok = false;
     }
     try {
       ht2.get(get);
-    } catch (RetriesExhaustedException e) {
+    } catch (IOException e) {
       ok = false;
     }
     assertTrue(ok);
@@ -369,6 +368,9 @@ public class TestAdmin {
     assertTrue(htd.equals(copy));
     // Now amend the copy. Introduce differences.
     long newFlushSize = htd.getMemStoreFlushSize() / 2;
+    if (newFlushSize <=0) {
+      newFlushSize = HTableDescriptor.DEFAULT_MEMSTORE_FLUSH_SIZE / 2;
+    }
     copy.setMemStoreFlushSize(newFlushSize);
     final String key = "anyoldkey";
     assertTrue(htd.getValue(key) == null);
@@ -457,6 +459,9 @@ public class TestAdmin {
     assertTrue(htd.equals(copy));
     // Now amend the copy. Introduce differences.
     long newFlushSize = htd.getMemStoreFlushSize() / 2;
+    if (newFlushSize <=0) {
+      newFlushSize = HTableDescriptor.DEFAULT_MEMSTORE_FLUSH_SIZE / 2;
+    }
     copy.setMemStoreFlushSize(newFlushSize);
     final String key = "anyoldkey";
     assertTrue(htd.getValue(key) == null);
@@ -869,116 +874,116 @@ public class TestAdmin {
     assertFalse(admin.tableExists(tableName));
     final HTable table = TEST_UTIL.createTable(tableName, familyNames,
       numVersions, blockSize);
-    try {
-      int rowCount = 0;
+    int rowCount = 0;
+    byte[] q = new byte[0];
 
-      // insert rows into column families. The number of rows that have values
-      // in a specific column family is decided by rowCounts[familyIndex]
-      for (int index = 0; index < familyNames.length; index++) {
-        for (int i = 0; i < rowCounts[index]; i++) {
-          byte[] k = Bytes.toBytes(i);
-          Put put = new Put(k);
-          put.add(familyNames[index], new byte[0], k);
-          table.put(put);
-        }
-
-        if ( rowCount < rowCounts[index] ) {
-          rowCount = rowCounts[index];
-        }
+    // insert rows into column families. The number of rows that have values
+    // in a specific column family is decided by rowCounts[familyIndex]
+    for (int index = 0; index < familyNames.length; index++) {
+      ArrayList<Put> puts = new ArrayList<Put>(rowCounts[index]);
+      for (int i = 0; i < rowCounts[index]; i++) {
+        byte[] k = Bytes.toBytes(i);
+        Put put = new Put(k);
+        put.add(familyNames[index], q, k);
+        puts.add(put);
       }
+      table.put(puts);
 
-      // get the initial layout (should just be one region)
-      Map<HRegionInfo,HServerAddress> m = table.getRegionsInfo();
-      System.out.println("Initial regions (" + m.size() + "): " + m);
-      assertTrue(m.size() == 1);
-
-      // Verify row count
-      Scan scan = new Scan();
-      ResultScanner scanner = table.getScanner(scan);
-      int rows = 0;
-      for(@SuppressWarnings("unused") Result result : scanner) {
-        rows++;
+      if ( rowCount < rowCounts[index] ) {
+        rowCount = rowCounts[index];
       }
-      scanner.close();
-      assertEquals(rowCount, rows);
-
-      // Have an outstanding scan going on to make sure we can scan over splits.
-      scan = new Scan();
-      scanner = table.getScanner(scan);
-      // Scan first row so we are into first region before split happens.
-      scanner.next();
-
-      final AtomicInteger count = new AtomicInteger(0);
-      Thread t = new Thread("CheckForSplit") {
-        public void run() {
-          for (int i = 0; i < 20; i++) {
-            try {
-              sleep(1000);
-            } catch (InterruptedException e) {
-              continue;
-            }
-            // check again    table = new HTable(conf, tableName);
-            Map<HRegionInfo, HServerAddress> regions = null;
-            try {
-              regions = table.getRegionsInfo();
-            } catch (IOException e) {
-              e.printStackTrace();
-            }
-            if (regions == null) continue;
-            count.set(regions.size());
-            if (count.get() >= 2) break;
-            LOG.debug("Cycle waiting on split");
-          }
-        }
-      };
-      t.start();
-      // Split the table
-      this.admin.split(tableName, splitPoint);
-      t.join();
-
-      // Verify row count
-      rows = 1; // We counted one row above.
-      for (@SuppressWarnings("unused") Result result : scanner) {
-        rows++;
-        if (rows > rowCount) {
-          scanner.close();
-          assertTrue("Scanned more than expected (" + rowCount + ")", false);
-        }
-      }
-      scanner.close();
-      assertEquals(rowCount, rows);
-
-      Map<HRegionInfo, HServerAddress> regions = null;
-      try {
-        regions = table.getRegionsInfo();
-      } catch (IOException e) {
-        e.printStackTrace();
-      }
-      assertEquals(2, regions.size());
-      HRegionInfo[] r = regions.keySet().toArray(new HRegionInfo[0]);
-      if (splitPoint != null) {
-        // make sure the split point matches our explicit configuration
-        assertEquals(Bytes.toString(splitPoint),
-            Bytes.toString(r[0].getEndKey()));
-        assertEquals(Bytes.toString(splitPoint),
-            Bytes.toString(r[1].getStartKey()));
-        LOG.debug("Properly split on " + Bytes.toString(splitPoint));
-      } else {
-        if (familyNames.length > 1) {
-          int splitKey = Bytes.toInt(r[0].getEndKey());
-          // check if splitKey is based on the largest column family
-          // in terms of it store size
-          int deltaForLargestFamily = Math.abs(rowCount/2 - splitKey);
-          for (int index = 0; index < familyNames.length; index++) {
-            int delta = Math.abs(rowCounts[index]/2 - splitKey);
-            assertTrue(delta >= deltaForLargestFamily);
-          }
-        }
-      }
-    } finally {
-      TEST_UTIL.deleteTable(tableName);
-      table.close();
     }
+
+    // get the initial layout (should just be one region)
+    Map<HRegionInfo,HServerAddress> m = table.getRegionsInfo();
+    System.out.println("Initial regions (" + m.size() + "): " + m);
+    assertTrue(m.size() == 1);
+
+    // Verify row count
+    Scan scan = new Scan();
+    ResultScanner scanner = table.getScanner(scan);
+    int rows = 0;
+    for(@SuppressWarnings("unused") Result result : scanner) {
+      rows++;
+    }
+    scanner.close();
+    assertEquals(rowCount, rows);
+
+    // Have an outstanding scan going on to make sure we can scan over splits.
+    scan = new Scan();
+    scanner = table.getScanner(scan);
+    // Scan first row so we are into first region before split happens.
+    scanner.next();
+
+    final AtomicInteger count = new AtomicInteger(0);
+    Thread t = new Thread("CheckForSplit") {
+      public void run() {
+        for (int i = 0; i < 20; i++) {
+          try {
+            sleep(1000);
+          } catch (InterruptedException e) {
+            continue;
+          }
+          // check again    table = new HTable(conf, tableName);
+          Map<HRegionInfo, HServerAddress> regions = null;
+          try {
+            regions = table.getRegionsInfo();
+          } catch (IOException e) {
+            e.printStackTrace();
+          }
+          if (regions == null) continue;
+          count.set(regions.size());
+          if (count.get() >= 2) break;
+          LOG.debug("Cycle waiting on split");
+        }
+      }
+    };
+    t.start();
+    // Split the table
+    this.admin.split(tableName, splitPoint);
+    t.join();
+
+    // Verify row count
+    rows = 1; // We counted one row above.
+    for (@SuppressWarnings("unused") Result result : scanner) {
+      rows++;
+      if (rows > rowCount) {
+        scanner.close();
+        assertTrue("Scanned more than expected (" + rowCount + ")", false);
+      }
+    }
+    scanner.close();
+    assertEquals(rowCount, rows);
+
+    Map<HRegionInfo, HServerAddress> regions = null;
+    try {
+      regions = table.getRegionsInfo();
+    } catch (IOException e) {
+      e.printStackTrace();
+    }
+    assertEquals(2, regions.size());
+    HRegionInfo[] r = regions.keySet().toArray(new HRegionInfo[0]);
+    if (splitPoint != null) {
+      // make sure the split point matches our explicit configuration
+      assertEquals(Bytes.toString(splitPoint),
+          Bytes.toString(r[0].getEndKey()));
+      assertEquals(Bytes.toString(splitPoint),
+          Bytes.toString(r[1].getStartKey()));
+      LOG.debug("Properly split on " + Bytes.toString(splitPoint));
+    } else {
+      if (familyNames.length > 1) {
+        int splitKey = Bytes.toInt(r[0].getEndKey());
+        // check if splitKey is based on the largest column family
+        // in terms of it store size
+        int deltaForLargestFamily = Math.abs(rowCount/2 - splitKey);
+        for (int index = 0; index < familyNames.length; index++) {
+          int delta = Math.abs(rowCounts[index]/2 - splitKey);
+          assertTrue(delta >= deltaForLargestFamily);
+        }
+      }
+    }
+    TEST_UTIL.deleteTable(tableName);
+    table.close();
   }
 
   /**
@@ -1000,15 +1005,16 @@ public class TestAdmin {
     ZooKeeperWatcher zkw = HBaseTestingUtility.getZooKeeperWatcher(TEST_UTIL);
     byte [] tableName = Bytes.toBytes("testMasterAdmin");
     TEST_UTIL.createTable(tableName, HConstants.CATALOG_FAMILY).close();
-    while (!ZKTable.isEnabledTable(zkw, "testMasterAdmin")) {
+    while (!ZKTableReadOnly.isEnabledTable(zkw, "testMasterAdmin")) {
       Thread.sleep(10);
     }
     this.admin.disableTable(tableName);
     try {
       new HTable(TEST_UTIL.getConfiguration(), tableName);
-    } catch (org.apache.hadoop.hbase.client.RegionOfflineException e) {
-      // Expected
+    } catch (DoNotRetryIOException e) {
+      //expected
     }
+
     this.admin.addColumn(tableName, new HColumnDescriptor("col2"));
     this.admin.enableTable(tableName);
     try {
@@ -1106,16 +1112,21 @@ public class TestAdmin {
   @Test
   public void testCreateTableRPCTimeOut() throws Exception {
     String name = "testCreateTableRPCTimeOut";
+    int oldTimeout = TEST_UTIL.getConfiguration().
+      getInt(HConstants.HBASE_RPC_TIMEOUT_KEY, HConstants.DEFAULT_HBASE_RPC_TIMEOUT);
     TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_RPC_TIMEOUT_KEY, 1500);
-
-    int expectedRegions = 100;
-    // Use 80 bit numbers to make sure we aren't limited
-    byte [] startKey = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
-    byte [] endKey =   { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
-    HBaseAdmin hbaseadmin = new HBaseAdmin(TEST_UTIL.getConfiguration());
-    hbaseadmin.createTable(new HTableDescriptor(name), startKey, endKey,
-      expectedRegions);
-    hbaseadmin.close();
+    try {
+      int expectedRegions = 100;
+      // Use 80 bit numbers to make sure we aren't limited
+      byte [] startKey = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+      byte [] endKey =   { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
+      HBaseAdmin hbaseadmin = new HBaseAdmin(TEST_UTIL.getConfiguration());
+      hbaseadmin.createTable(new HTableDescriptor(name), startKey, endKey,
+        expectedRegions);
+      hbaseadmin.close();
+    } finally {
+      TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_RPC_TIMEOUT_KEY, oldTimeout);
+    }
   }
 
   /**
@@ -1529,6 +1540,55 @@ public class TestAdmin {
     Assert.assertEquals(initialCount, finalCount) ;
   }
 
+  @Test
+  public void testDisableCatalogTable() throws Exception {
+    try {
+      this.admin.disableTable(".META.");
+      fail("Expected to throw IllegalArgumentException");
+    } catch (IllegalArgumentException e) {
+    }
+    // Before the fix for HBASE-6146, the below table creation was failing as the META table
+    // actually getting disabled by the disableTable() call.
+    HTableDescriptor htd = new HTableDescriptor("testDisableCatalogTable".getBytes());
+    HColumnDescriptor hcd = new HColumnDescriptor("cf1".getBytes());
+    htd.addFamily(hcd);
+    TEST_UTIL.getHBaseAdmin().createTable(htd);
+  }
+
+  @Test
+  public void testGetRegion() throws Exception {
+    final String name = "testGetRegion";
+    LOG.info("Started " + name);
+    final byte [] nameBytes = Bytes.toBytes(name);
+    HTable t = TEST_UTIL.createTable(nameBytes, HConstants.CATALOG_FAMILY);
+    TEST_UTIL.createMultiRegions(t, HConstants.CATALOG_FAMILY);
+    CatalogTracker ct = new CatalogTracker(TEST_UTIL.getConfiguration());
+    ct.start();
+    try {
+      HRegionLocation regionLocation = t.getRegionLocation("mmm");
+      HRegionInfo region = regionLocation.getRegionInfo();
+      byte[] regionName = region.getRegionName();
+      Pair<HRegionInfo, ServerName> pair = admin.getRegion(regionName, ct);
+      assertTrue(Bytes.equals(regionName, pair.getFirst().getRegionName()));
+      pair = admin.getRegion(region.getEncodedNameAsBytes(), ct);
+      assertTrue(Bytes.equals(regionName, pair.getFirst().getRegionName()));
+    } finally {
+      ct.stop();
+    }
+  }
+  
+  @Test
+  public void testRootTableSplit() throws Exception {
+    Scan s = new Scan();
+    HTable rootTable = new HTable(TEST_UTIL.getConfiguration(), HConstants.ROOT_TABLE_NAME);
+    ResultScanner scanner = rootTable.getScanner(s);
+    Result metaEntry = scanner.next();
+    this.admin.split(HConstants.ROOT_TABLE_NAME, metaEntry.getRow());
+    Thread.sleep(1000);
+    List<HRegion> regions = TEST_UTIL.getMiniHBaseCluster().getRegions(HConstants.ROOT_TABLE_NAME);
+    assertEquals("ROOT region should not be splitted.",1, regions.size());
+  }
+  
   @org.junit.Rule
   public org.apache.hadoop.hbase.ResourceCheckerJUnitRule cu =
     new org.apache.hadoop.hbase.ResourceCheckerJUnitRule();

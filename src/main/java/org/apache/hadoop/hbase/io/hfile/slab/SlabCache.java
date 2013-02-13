@@ -59,10 +59,8 @@ public class SlabCache implements SlabItemActionWatcher, BlockCache, HeapSize {
   static final Log LOG = LogFactory.getLog(SlabCache.class);
   static final int STAT_THREAD_PERIOD_SECS = 60 * 5;
 
-  private final ScheduledExecutorService scheduleThreadPool = Executors
-      .newScheduledThreadPool(1,
-          new ThreadFactoryBuilder().setNameFormat("Slab Statistics #%d")
-              .build());
+  private final ScheduledExecutorService scheduleThreadPool = Executors.newScheduledThreadPool(1,
+      new ThreadFactoryBuilder().setDaemon(true).setNameFormat("Slab Statistics #%d").build());
 
   long size;
   private final CacheStats stats;
@@ -230,24 +228,25 @@ public class SlabCache implements SlabItemActionWatcher, BlockCache, HeapSize {
 
   /**
    * Get the buffer of the block with the specified name.
-   *
-   * @param key
    * @param caching
+   * @param key
+   * @param repeat
+   *
    * @return buffer of specified block name, or null if not in cache
    */
-  public Cacheable getBlock(BlockCacheKey key, boolean caching) {
+  public Cacheable getBlock(BlockCacheKey key, boolean caching, boolean repeat) {
     SingleSizeCache cachedBlock = backingStore.get(key);
     if (cachedBlock == null) {
-      stats.miss(caching);
+      if (!repeat) stats.miss(caching);
       return null;
     }
 
-    Cacheable contentBlock = cachedBlock.getBlock(key, caching);
+    Cacheable contentBlock = cachedBlock.getBlock(key, caching, false);
 
     if (contentBlock != null) {
       stats.hit(caching);
     } else {
-      stats.miss(caching);
+      if (!repeat) stats.miss(caching);
     }
     return contentBlock;
   }

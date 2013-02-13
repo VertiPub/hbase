@@ -32,6 +32,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.rest.filter.GzipFilter;
 import org.apache.hadoop.hbase.security.User;
+import org.apache.hadoop.hbase.util.InfoServer;
 import org.apache.hadoop.hbase.util.Strings;
 import org.apache.hadoop.hbase.util.VersionInfo;
 import org.apache.hadoop.net.DNS;
@@ -44,6 +45,7 @@ import org.mortbay.jetty.Server;
 import org.mortbay.jetty.nio.SelectChannelConnector;
 import org.mortbay.jetty.servlet.Context;
 import org.mortbay.jetty.servlet.ServletHolder;
+import org.mortbay.thread.QueuedThreadPool;
 
 import com.sun.jersey.spi.container.servlet.ServletContainer;
 
@@ -62,7 +64,7 @@ public class Main implements Constants {
     HelpFormatter formatter = new HelpFormatter();
     formatter.printHelp("bin/hbase rest start", "", options,
       "\nTo run the REST server as a daemon, execute " +
-      "bin/hbase-daemon.sh start|stop rest [-p <port>] [-ro]\n", true);
+      "bin/hbase-daemon.sh start|stop rest [--infoport <port>] [-p <port>] [-ro]\n", true);
     System.exit(exitCode);
   }
 
@@ -82,6 +84,7 @@ public class Main implements Constants {
     options.addOption("p", "port", true, "Port to bind to [default: 8080]");
     options.addOption("ro", "readonly", false, "Respond only to GET HTTP " +
       "method requests [default: false]");
+    options.addOption(null, "infoport", true, "Port for web UI");
 
     CommandLine commandLine = null;
     try {
@@ -103,6 +106,14 @@ public class Main implements Constants {
     if (commandLine != null && commandLine.hasOption("readonly")) {
       servlet.getConfiguration().setBoolean("hbase.rest.readonly", true);
       LOG.debug("readonly set to true");
+    }
+
+    // check for user-defined info server port setting, if so override the conf
+    if (commandLine != null && commandLine.hasOption("infoport")) {
+      String val = commandLine.getOptionValue("infoport");
+      servlet.getConfiguration()
+          .setInt("hbase.rest.info.port", Integer.valueOf(val));
+      LOG.debug("Web UI port set to " + val);
     }
 
     @SuppressWarnings("unchecked")
@@ -139,21 +150,43 @@ public class Main implements Constants {
 
     server.addConnector(connector);
 
+    // Set the default max thread number to 100 to limit
+    // the number of concurrent requests so that REST server doesn't OOM easily.
+    // Jetty set the default max thread number to 250, if we don't set it.
+    //
+    // Our default min thread number 2 is the same as that used by Jetty.
+    int maxThreads = servlet.getConfiguration().getInt("hbase.rest.threads.max", 100);
+    int minThreads = servlet.getConfiguration().getInt("hbase.rest.threads.min", 2);
+    QueuedThreadPool threadPool = new QueuedThreadPool(maxThreads);
+    threadPool.setMinThreads(minThreads);
+    server.setThreadPool(threadPool);
+
     server.setSendServerVersion(false);
     server.setSendDateHeader(false);
     server.setStopAtShutdown(true);
-      // set up context
+
+    // set up context
     Context context = new Context(server, "/", Context.SESSIONS);
     context.addServlet(sh, "/*");
     context.addFilter(GzipFilter.class, "/*", 0);
 
-    // login the server principal (if using secure Hadoop)   
+    // login the server principal (if using secure Hadoop)
     if (User.isSecurityEnabled() && User.isHBaseSecurityEnabled(conf)) {
       String machineName = Strings.domainNamePointerToHostName(
         DNS.getDefaultHost(conf.get("hbase.rest.dns.interface", "default"),
           conf.get("hbase.rest.dns.nameserver", "default")));
       User.login(conf, "hbase.rest.keytab.file", "hbase.rest.kerberos.principal",
         machineName);
+    }
+
+    // Put up info server.
+    int port = conf.getInt("hbase.rest.info.port", 8085);
+    if (port >= 0) {
+      conf.setLong("startcode", System.currentTimeMillis());
+      String a = conf.get("hbase.rest.info.bindAddress", "0.0.0.0");
+      InfoServer infoServer = new InfoServer("rest", a, port, false, conf);
+      infoServer.setAttribute("hbase.conf", conf);
+      infoServer.start();
     }
 
     // start server

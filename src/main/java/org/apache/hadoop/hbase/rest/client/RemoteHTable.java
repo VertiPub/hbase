@@ -72,19 +72,14 @@ public class RemoteHTable implements HTableInterface {
   final Client client;
   final Configuration conf;
   final byte[] name;
-  final String accessToken;
   final int maxRetries;
   final long sleepTime;
 
-  @SuppressWarnings("unchecked")
+  @SuppressWarnings("rawtypes")
   protected String buildRowSpec(final byte[] row, final Map familyMap, 
       final long startTime, final long endTime, final int maxVersions) {
     StringBuffer sb = new StringBuffer();
     sb.append('/');
-    if (accessToken != null) {
-      sb.append(accessToken);
-      sb.append('/');
-    }
     sb.append(Bytes.toStringBinary(name));
     sb.append('/');
     sb.append(Bytes.toStringBinary(row));
@@ -142,6 +137,29 @@ public class RemoteHTable implements HTableInterface {
     return sb.toString();
   }
 
+  protected String buildMultiRowSpec(final byte[][] rows, int maxVersions) {
+    StringBuilder sb = new StringBuilder();
+    sb.append('/');
+    sb.append(Bytes.toStringBinary(name));
+    sb.append("/multiget/");
+    if (rows == null || rows.length == 0) {
+      return sb.toString();
+    }
+    sb.append("?");
+    for(int i=0; i<rows.length; i++) {
+      byte[] rk = rows[i];
+      if (i != 0) {
+        sb.append('&');
+      }
+      sb.append("row=");
+      sb.append(Bytes.toStringBinary(rk));
+    }
+    sb.append("&v=");
+    sb.append(maxVersions);
+
+    return sb.toString();
+  }
+
   protected Result[] buildResultFromModel(final CellSetModel model) {
     List<Result> results = new ArrayList<Result>();
     for (RowModel row: model.getRows()) {
@@ -187,7 +205,9 @@ public class RemoteHTable implements HTableInterface {
    * @param client
    * @param name
    * @param accessToken
+   * @deprecated accessToken is not used and will be removed
    */
+  @Deprecated
   public RemoteHTable(Client client, String name, String accessToken) {
     this(client, HBaseConfiguration.create(), Bytes.toBytes(name), accessToken);
   }
@@ -197,8 +217,20 @@ public class RemoteHTable implements HTableInterface {
    * @param client
    * @param conf
    * @param name
-   * @param accessToken
    */
+  public RemoteHTable(Client client, Configuration conf, String name) {
+    this(client, conf, Bytes.toBytes(name), null);
+  }
+
+  /**
+   * Constructor
+   * @param client
+   * @param conf
+   * @param name
+   * @param accessToken
+   * @deprecated accessToken is not used and will be removed
+   */
+  @Deprecated
   public RemoteHTable(Client client, Configuration conf, String name,
       String accessToken) {
     this(client, conf, Bytes.toBytes(name), accessToken);
@@ -206,14 +238,28 @@ public class RemoteHTable implements HTableInterface {
 
   /**
    * Constructor
+   * @param client
    * @param conf
+   * @param name
    */
+  public RemoteHTable(Client client, Configuration conf, byte[] name) {
+    this(client, conf, name, null);
+  }
+
+  /**
+   * Constructor
+   * @param client
+   * @param conf
+   * @param name
+   * @param accessToken
+   * @deprecated accessToken is not used and will be removed
+   */
+  @Deprecated
   public RemoteHTable(Client client, Configuration conf, byte[] name,
       String accessToken) {
     this.client = client;
     this.conf = conf;
     this.name = name;
-    this.accessToken = accessToken;
     this.maxRetries = conf.getInt("hbase.rest.client.max.retries", 10);
     this.sleepTime = conf.getLong("hbase.rest.client.sleep", 1000);
   }
@@ -229,10 +275,6 @@ public class RemoteHTable implements HTableInterface {
   public HTableDescriptor getTableDescriptor() throws IOException {
     StringBuilder sb = new StringBuilder();
     sb.append('/');
-    if (accessToken != null) {
-      sb.append(accessToken);
-      sb.append('/');
-    }
     sb.append(Bytes.toStringBinary(name));
     sb.append('/');
     sb.append("schema");
@@ -267,30 +309,68 @@ public class RemoteHTable implements HTableInterface {
     if (get.getFilter() != null) {
       LOG.warn("filters not supported on gets");
     }
+    Result[] results = getResults(spec);
+    if (results.length > 0) {
+      if (results.length > 1) {
+        LOG.warn("too many results for get (" + results.length + ")");
+      }
+      return results[0];
+    } else {
+      return new Result();
+    }
+  }
+
+  public Result[] get(List<Get> gets) throws IOException {
+    byte[][] rows = new byte[gets.size()][];
+    int maxVersions = 1;
+    int count = 0;
+
+    for (Get g : gets) {
+
+      if (count == 0) {
+        maxVersions = g.getMaxVersions();
+      } else if (g.getMaxVersions() != maxVersions) {
+        LOG.warn("MaxVersions on Gets do not match, using the first in the list ("
+            + maxVersions +")");
+      }
+
+      if (g.getFilter() != null) {
+        LOG.warn("filters not supported on gets");
+      }
+
+      rows[count] = g.getRow();
+      count++;
+    }
+
+    String spec = buildMultiRowSpec(rows, maxVersions);
+
+    return getResults(spec);
+  }
+
+  private Result[] getResults(String spec) throws IOException {
     for (int i = 0; i < maxRetries; i++) {
       Response response = client.get(spec, Constants.MIMETYPE_PROTOBUF);
       int code = response.getCode();
       switch (code) {
-      case 200:
-        CellSetModel model = new CellSetModel();
-        model.getObjectFromMessage(response.getBody());
-        Result[] results = buildResultFromModel(model);
-        if (results.length > 0) {
-          if (results.length > 1) {
-            LOG.warn("too many results for get (" + results.length + ")");
+        case 200:
+          CellSetModel model = new CellSetModel();
+          model.getObjectFromMessage(response.getBody());
+          Result[] results = buildResultFromModel(model);
+          if (results.length > 0) {
+            return results;
           }
-          return results[0];
-        }
-        // fall through
-      case 404:
-        return new Result();
-      case 509:
-        try {
-          Thread.sleep(sleepTime);
-        } catch (InterruptedException e) { }
-        break;
-      default:
-        throw new IOException("get request returned " + code);
+          // fall through
+        case 404:
+          return new Result[0];
+
+        case 509:
+          try {
+            Thread.sleep(sleepTime);
+          } catch (InterruptedException e) {
+          }
+          break;
+        default:
+          throw new IOException("get request returned " + code);
       }
     }
     throw new IOException("get request timed out");
@@ -306,10 +386,6 @@ public class RemoteHTable implements HTableInterface {
     CellSetModel model = buildModelFromPut(put);
     StringBuilder sb = new StringBuilder();
     sb.append('/');
-    if (accessToken != null) {
-      sb.append(accessToken);
-      sb.append('/');      
-    }
     sb.append(Bytes.toStringBinary(name));
     sb.append('/');
     sb.append(Bytes.toStringBinary(put.getRow()));
@@ -364,10 +440,6 @@ public class RemoteHTable implements HTableInterface {
     // build path for multiput
     StringBuilder sb = new StringBuilder();
     sb.append('/');
-    if (accessToken != null) {
-      sb.append(accessToken);
-      sb.append('/');      
-    }
     sb.append(Bytes.toStringBinary(name));
     sb.append("/$multiput"); // can be any nonexistent row
     for (int i = 0; i < maxRetries; i++) {
@@ -433,10 +505,6 @@ public class RemoteHTable implements HTableInterface {
       }
       StringBuffer sb = new StringBuffer();
       sb.append('/');
-      if (accessToken != null) {
-        sb.append(accessToken);
-        sb.append('/');
-      }
       sb.append(Bytes.toStringBinary(name));
       sb.append('/');
       sb.append("scanner");
@@ -575,22 +643,88 @@ public class RemoteHTable implements HTableInterface {
     throw new IOException("getRowOrBefore not supported");
   }
 
+  /**
+   * @deprecated {@link RowLock} and associated operations are deprecated
+   */
   public RowLock lockRow(byte[] row) throws IOException {
     throw new IOException("lockRow not implemented");
   }
 
+  /**
+   * @deprecated {@link RowLock} and associated operations are deprecated
+   */
   public void unlockRow(RowLock rl) throws IOException {
     throw new IOException("unlockRow not implemented");
   }
 
   public boolean checkAndPut(byte[] row, byte[] family, byte[] qualifier,
       byte[] value, Put put) throws IOException {
-    throw new IOException("checkAndPut not supported");
+    // column to check-the-value
+    put.add(new KeyValue(row, family, qualifier, value));
+
+    CellSetModel model = buildModelFromPut(put);
+    StringBuilder sb = new StringBuilder();
+    sb.append('/');
+    sb.append(Bytes.toStringBinary(name));
+    sb.append('/');
+    sb.append(Bytes.toStringBinary(put.getRow()));
+    sb.append("?check=put");
+
+    for (int i = 0; i < maxRetries; i++) {
+      Response response = client.put(sb.toString(),
+        Constants.MIMETYPE_PROTOBUF, model.createProtobufOutput());
+      int code = response.getCode();
+      switch (code) {
+      case 200:
+        return true;
+      case 304: // NOT-MODIFIED
+        return false;
+      case 509:
+        try {
+          Thread.sleep(sleepTime);
+        } catch (final InterruptedException e) {
+        }
+        break;
+      default:
+        throw new IOException("checkAndPut request failed with " + code);
+      }
+    }
+    throw new IOException("checkAndPut request timed out");
   }
 
   public boolean checkAndDelete(byte[] row, byte[] family, byte[] qualifier,
       byte[] value, Delete delete) throws IOException {
-    throw new IOException("checkAndDelete not supported");
+    Put put = new Put(row);
+    // column to check-the-value
+    put.add(new KeyValue(row, family, qualifier, value));
+    CellSetModel model = buildModelFromPut(put);
+    StringBuilder sb = new StringBuilder();
+    sb.append('/');
+    sb.append(Bytes.toStringBinary(name));
+    sb.append('/');
+    sb.append(Bytes.toStringBinary(row));
+    sb.append("?check=delete");
+
+    for (int i = 0; i < maxRetries; i++) {
+      Response response = client.put(sb.toString(),
+        Constants.MIMETYPE_PROTOBUF, model.createProtobufOutput());
+      int code = response.getCode();
+      switch (code) {
+      case 200:
+        return true;
+      case 304: // NOT-MODIFIED
+        return false;
+      case 509:
+        try {
+          Thread.sleep(sleepTime);
+        } catch (final InterruptedException e) {
+        }
+        break;
+      default:
+        throw new IOException("checkAndDelete request failed with " + code);
+      }
+    }
+    throw new IOException("checkAndDelete request timed out");
   }
 
   public Result increment(Increment increment) throws IOException {
@@ -622,11 +756,6 @@ public class RemoteHTable implements HTableInterface {
   }
 
   @Override
-  public Result[] get(List<Get> gets) throws IOException {
-    throw new IOException("get(List<Get>) not supported");
-  }
-
-  @Override
   public <T extends CoprocessorProtocol> T coprocessorProxy(Class<T> protocol,
       byte[] row) {
     throw new
@@ -652,5 +781,25 @@ public class RemoteHTable implements HTableInterface {
   @Override
   public void mutateRow(RowMutations rm) throws IOException {
     throw new IOException("atomicMutation not supported");
+  }
+
+  @Override
+  public void setAutoFlush(boolean autoFlush) {
+    throw new UnsupportedOperationException("setAutoFlush not implemented");
+  }
+
+  @Override
+  public void setAutoFlush(boolean autoFlush, boolean clearBufferOnFail) {
+    throw new UnsupportedOperationException("setAutoFlush not implemented");
+  }
+
+  @Override
+  public long getWriteBufferSize() {
+    throw new UnsupportedOperationException("getWriteBufferSize not implemented");
+  }
+
+  @Override
+  public void setWriteBufferSize(long writeBufferSize) throws IOException {
+    throw new IOException("setWriteBufferSize not supported");
   }
 }

@@ -20,21 +20,38 @@
 
 package org.apache.hadoop.hbase.regionserver;
 
-import com.google.common.collect.ImmutableList;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.regex.Matcher;
+
+import org.apache.commons.collections.map.AbstractReferenceMap;
+import org.apache.commons.collections.map.ReferenceMap;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.HBaseConfiguration;
-import org.apache.hadoop.hbase.HRegionInfo;
-import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.Coprocessor;
 import org.apache.hadoop.hbase.CoprocessorEnvironment;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.client.*;
-import org.apache.hadoop.hbase.coprocessor.*;
+import org.apache.hadoop.hbase.HRegionInfo;
+import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.client.Append;
+import org.apache.hadoop.hbase.client.Delete;
+import org.apache.hadoop.hbase.client.Get;
+import org.apache.hadoop.hbase.client.Increment;
+import org.apache.hadoop.hbase.client.Put;
+import org.apache.hadoop.hbase.client.Result;
+import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
+import org.apache.hadoop.hbase.coprocessor.ObserverContext;
+import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
+import org.apache.hadoop.hbase.coprocessor.RegionObserver;
 import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.filter.WritableByteArrayComparable;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
@@ -42,11 +59,10 @@ import org.apache.hadoop.hbase.ipc.CoprocessorProtocol;
 import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
 import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.util.StringUtils;
 
-import java.io.IOException;
-import java.util.*;
-import java.util.regex.Matcher;
+import com.google.common.collect.ImmutableList;
 
 /**
  * Implements the coprocessor environment and runtime support for coprocessors
@@ -56,6 +72,9 @@ public class RegionCoprocessorHost
     extends CoprocessorHost<RegionCoprocessorHost.RegionEnvironment> {
 
   private static final Log LOG = LogFactory.getLog(RegionCoprocessorHost.class);
+  // The shared data map
+  private static ReferenceMap sharedDataMap =
+      new ReferenceMap(AbstractReferenceMap.HARD, AbstractReferenceMap.WEAK);
 
   /**
    * Encapsulation of the environment of each coprocessor
@@ -65,6 +84,7 @@ public class RegionCoprocessorHost
 
     private HRegion region;
     private RegionServerServices rsServices;
+    ConcurrentMap<String, Object> sharedData;
 
     /**
      * Constructor
@@ -73,10 +93,11 @@ public class RegionCoprocessorHost
      */
     public RegionEnvironment(final Coprocessor impl, final int priority,
         final int seq, final Configuration conf, final HRegion region,
-        final RegionServerServices services) {
+        final RegionServerServices services, final ConcurrentMap<String, Object> sharedData) {
       super(impl, priority, seq, conf);
       this.region = region;
       this.rsServices = services;
+      this.sharedData = sharedData;
     }
 
     /** @return the region */
@@ -94,6 +115,11 @@ public class RegionCoprocessorHost
     public void shutdown() {
       super.shutdown();
     }
+
+    @Override
+    public ConcurrentMap<String, Object> getSharedData() {
+      return sharedData;
+    }
   }
 
   /** The region server services */
@@ -109,6 +135,7 @@ public class RegionCoprocessorHost
    */
   public RegionCoprocessorHost(final HRegion region,
       final RegionServerServices rsServices, final Configuration conf) {
+    this.conf = conf;
     this.rsServices = rsServices;
     this.region = region;
     this.pathPrefix = Integer.toString(this.region.getRegionInfo().hashCode());
@@ -153,7 +180,7 @@ public class RegionCoprocessorHost
             }
             if (cfgSpec != null) {
               cfgSpec = cfgSpec.substring(cfgSpec.indexOf('|') + 1);
-              Configuration newConf = HBaseConfiguration.create(conf);
+              Configuration newConf = new Configuration(conf);
               Matcher m = HConstants.CP_HTD_ATTR_VALUE_PARAM_PATTERN.matcher(cfgSpec);
               while (m.find()) {
                 newConf.set(m.group(1), m.group(2));
@@ -193,8 +220,19 @@ public class RegionCoprocessorHost
         break;
       }
     }
+    ConcurrentMap<String, Object> classData;
+    // make sure only one thread can add maps
+    synchronized (sharedDataMap) {
+      // as long as at least one RegionEnvironment holds on to its classData it will
+      // remain in this map
+      classData = (ConcurrentMap<String, Object>)sharedDataMap.get(implClass.getName());
+      if (classData == null) {
+        classData = new ConcurrentHashMap<String, Object>();
+        sharedDataMap.put(implClass.getName(), classData);
+      }
+    }
     return new RegionEnvironment(instance, priority, seq, conf, region,
-        rsServices);
+        rsServices, classData);
   }
 
   @Override
@@ -227,7 +265,7 @@ public class RegionCoprocessorHost
   /**
    * Invoked before a region open
    */
-  public void preOpen() {
+  public void preOpen(){
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     for (RegionEnvironment env: coprocessors) {
       if (env.getInstance() instanceof RegionObserver) {
@@ -247,7 +285,7 @@ public class RegionCoprocessorHost
   /**
    * Invoked after a region open
    */
-  public void postOpen() {
+  public void postOpen(){
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     for (RegionEnvironment env: coprocessors) {
       if (env.getInstance() instanceof RegionObserver) {
@@ -268,7 +306,7 @@ public class RegionCoprocessorHost
    * Invoked before a region is closed
    * @param abortRequested true if the server is aborting
    */
-  public void preClose(boolean abortRequested) {
+  public void preClose(boolean abortRequested) throws IOException {
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     for (RegionEnvironment env: coprocessors) {
       if (env.getInstance() instanceof RegionObserver) {
@@ -276,7 +314,7 @@ public class RegionCoprocessorHost
         try {
           ((RegionObserver)env.getInstance()).preClose(ctx, abortRequested);
         } catch (Throwable e) {
-          handleCoprocessorThrowableNoRethrow(env, e);
+          handleCoprocessorThrowable(env, e);
         }
       }
     }
@@ -286,7 +324,7 @@ public class RegionCoprocessorHost
    * Invoked after a region is closed
    * @param abortRequested true if the server is aborting
    */
-  public void postClose(boolean abortRequested) {
+  public void postClose(boolean abortRequested){
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     for (RegionEnvironment env: coprocessors) {
       if (env.getInstance() instanceof RegionObserver) {
@@ -303,20 +341,51 @@ public class RegionCoprocessorHost
   }
 
   /**
+   * See
+   * {@link RegionObserver#preCompactScannerOpen(ObserverContext, Store, List, ScanType, long, InternalScanner)}
+   */
+  public InternalScanner preCompactScannerOpen(Store store, List<StoreFileScanner> scanners,
+      ScanType scanType, long earliestPutTs) throws IOException {
+    ObserverContext<RegionCoprocessorEnvironment> ctx = null;
+    InternalScanner s = null;
+    for (RegionEnvironment env: coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        ctx = ObserverContext.createAndPrepare(env, ctx);
+        try {
+          s = ((RegionObserver) env.getInstance()).preCompactScannerOpen(ctx, store, scanners,
+              scanType, earliestPutTs, s);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env,e);
+        }
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+    return s;
+  }
+
+  /**
    * Called prior to selecting the {@link StoreFile}s for compaction from
    * the list of currently available candidates.
    * @param store The store where compaction is being requested
    * @param candidates The currently available store files
    * @return If {@code true}, skip the normal selection process and use the current list
+   * @throws IOException
    */
-  public boolean preCompactSelection(Store store, List<StoreFile> candidates) {
+  public boolean preCompactSelection(Store store, List<StoreFile> candidates) throws IOException {
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     boolean bypass = false;
     for (RegionEnvironment env: coprocessors) {
       if (env.getInstance() instanceof RegionObserver) {
         ctx = ObserverContext.createAndPrepare(env, ctx);
-        ((RegionObserver)env.getInstance()).preCompactSelection(
-            ctx, store, candidates);
+        try {
+          ((RegionObserver)env.getInstance()).preCompactSelection(
+              ctx, store, candidates);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env,e);
+
+        }
         bypass |= ctx.shouldBypass();
         if (ctx.shouldComplete()) {
           break;
@@ -355,8 +424,9 @@ public class RegionCoprocessorHost
    * Called prior to rewriting the store files selected for compaction
    * @param store the store being compacted
    * @param scanner the scanner used to read store data during compaction
+   * @throws IOException 
    */
-  public InternalScanner preCompact(Store store, InternalScanner scanner) {
+  public InternalScanner preCompact(Store store, InternalScanner scanner) throws IOException {
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     boolean bypass = false;
     for (RegionEnvironment env: coprocessors) {
@@ -366,7 +436,7 @@ public class RegionCoprocessorHost
           scanner = ((RegionObserver)env.getInstance()).preCompact(
               ctx, store, scanner);
         } catch (Throwable e) {
-          handleCoprocessorThrowableNoRethrow(env,e);
+          handleCoprocessorThrowable(env,e);
         }
         bypass |= ctx.shouldBypass();
         if (ctx.shouldComplete()) {
@@ -381,8 +451,9 @@ public class RegionCoprocessorHost
    * Called after the store compaction has completed.
    * @param store the store being compacted
    * @param resultFile the new store file written during compaction
+   * @throws IOException
    */
-  public void postCompact(Store store, StoreFile resultFile) {
+  public void postCompact(Store store, StoreFile resultFile) throws IOException {
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     for (RegionEnvironment env: coprocessors) {
       if (env.getInstance() instanceof RegionObserver) {
@@ -390,7 +461,7 @@ public class RegionCoprocessorHost
         try {
           ((RegionObserver)env.getInstance()).postCompact(ctx, store, resultFile);
         } catch (Throwable e) {
-          handleCoprocessorThrowableNoRethrow(env, e);
+          handleCoprocessorThrowable(env, e);
         }
         if (ctx.shouldComplete()) {
           break;
@@ -401,8 +472,34 @@ public class RegionCoprocessorHost
 
   /**
    * Invoked before a memstore flush
+   * @throws IOException
    */
-  public void preFlush() {
+  public InternalScanner preFlush(Store store, InternalScanner scanner) throws IOException {
+    ObserverContext<RegionCoprocessorEnvironment> ctx = null;
+    boolean bypass = false;
+    for (RegionEnvironment env: coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        ctx = ObserverContext.createAndPrepare(env, ctx);
+        try {
+          scanner = ((RegionObserver)env.getInstance()).preFlush(
+              ctx, store, scanner);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env,e);
+        }
+        bypass |= ctx.shouldBypass();
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+    return bypass ? null : scanner;
+  }
+
+  /**
+   * Invoked before a memstore flush
+   * @throws IOException 
+   */
+  public void preFlush() throws IOException {
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     for (RegionEnvironment env: coprocessors) {
       if (env.getInstance() instanceof RegionObserver) {
@@ -410,7 +507,51 @@ public class RegionCoprocessorHost
         try {
           ((RegionObserver)env.getInstance()).preFlush(ctx);
         } catch (Throwable e) {
-          handleCoprocessorThrowableNoRethrow(env, e);
+          handleCoprocessorThrowable(env, e);
+        }
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+  }
+
+  /**
+   * See
+   * {@link RegionObserver#preFlush(ObserverContext, Store, KeyValueScanner)}
+   */
+  public InternalScanner preFlushScannerOpen(Store store, KeyValueScanner memstoreScanner) throws IOException {
+    ObserverContext<RegionCoprocessorEnvironment> ctx = null;
+    InternalScanner s = null;
+    for (RegionEnvironment env : coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        ctx = ObserverContext.createAndPrepare(env, ctx);
+        try {
+          s = ((RegionObserver) env.getInstance()).preFlushScannerOpen(ctx, store, memstoreScanner, s);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env, e);
+        }
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+    return s;
+  }
+
+  /**
+   * Invoked after a memstore flush
+   * @throws IOException
+   */
+  public void postFlush() throws IOException {
+    ObserverContext<RegionCoprocessorEnvironment> ctx = null;
+    for (RegionEnvironment env: coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        ctx = ObserverContext.createAndPrepare(env, ctx);
+        try {
+          ((RegionObserver)env.getInstance()).postFlush(ctx);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env, e);
         }
         if (ctx.shouldComplete()) {
           break;
@@ -421,16 +562,17 @@ public class RegionCoprocessorHost
 
   /**
    * Invoked after a memstore flush
+   * @throws IOException
    */
-  public void postFlush() {
+  public void postFlush(final Store store, final StoreFile storeFile) throws IOException {
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     for (RegionEnvironment env: coprocessors) {
       if (env.getInstance() instanceof RegionObserver) {
         ctx = ObserverContext.createAndPrepare(env, ctx);
         try {
-          ((RegionObserver)env.getInstance()).postFlush(ctx);
+          ((RegionObserver)env.getInstance()).postFlush(ctx, store, storeFile);
         } catch (Throwable e) {
-          handleCoprocessorThrowableNoRethrow(env, e);
+          handleCoprocessorThrowable(env, e);
         }
         if (ctx.shouldComplete()) {
           break;
@@ -441,8 +583,9 @@ public class RegionCoprocessorHost
 
   /**
    * Invoked just before a split
+   * @throws IOException
    */
-  public void preSplit() {
+  public void preSplit() throws IOException {
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     for (RegionEnvironment env: coprocessors) {
       if (env.getInstance() instanceof RegionObserver) {
@@ -450,7 +593,7 @@ public class RegionCoprocessorHost
         try {
           ((RegionObserver)env.getInstance()).preSplit(ctx);
         } catch (Throwable e) {
-          handleCoprocessorThrowableNoRethrow(env, e);
+          handleCoprocessorThrowable(env, e);
         }
         if (ctx.shouldComplete()) {
           break;
@@ -463,8 +606,9 @@ public class RegionCoprocessorHost
    * Invoked just after a split
    * @param l the new left-hand daughter region
    * @param r the new right-hand daughter region
+   * @throws IOException 
    */
-  public void postSplit(HRegion l, HRegion r) {
+  public void postSplit(HRegion l, HRegion r) throws IOException {
     ObserverContext<RegionCoprocessorEnvironment> ctx = null;
     for (RegionEnvironment env: coprocessors) {
       if (env.getInstance() instanceof RegionObserver) {
@@ -472,7 +616,7 @@ public class RegionCoprocessorHost
         try {
           ((RegionObserver)env.getInstance()).postSplit(ctx, l, r);
         } catch (Throwable e) {
-          handleCoprocessorThrowableNoRethrow(env, e);
+          handleCoprocessorThrowable(env, e);
         }
         if (ctx.shouldComplete()) {
           break;
@@ -1076,6 +1220,31 @@ public class RegionCoprocessorHost
   }
 
   /**
+   * See
+   * {@link RegionObserver#preStoreScannerOpen(ObserverContext, Store, Scan, NavigableSet, KeyValueScanner)}
+   */
+  public KeyValueScanner preStoreScannerOpen(Store store, Scan scan,
+      final NavigableSet<byte[]> targetCols) throws IOException {
+    KeyValueScanner s = null;
+    ObserverContext<RegionCoprocessorEnvironment> ctx = null;
+    for (RegionEnvironment env: coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        ctx = ObserverContext.createAndPrepare(env, ctx);
+        try {
+          s = ((RegionObserver) env.getInstance()).preStoreScannerOpen(ctx, store, scan,
+              targetCols, s);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env, e);
+        }
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+    return s;
+  }
+
+  /**
    * @param scan the Scan specification
    * @param s the scanner
    * @return the scanner instance to use
@@ -1160,6 +1329,35 @@ public class RegionCoprocessorHost
     return hasMore;
   }
 
+  /**
+   * This will be called by the scan flow when the current scanned row is being filtered out by the
+   * filter.
+   * @param s the scanner
+   * @param currentRow The current rowkey which got filtered out
+   * @return whether more rows are available for the scanner or not
+   * @throws IOException
+   */
+  public boolean postScannerFilterRow(final InternalScanner s, final byte[] currentRow)
+      throws IOException {
+    boolean hasMore = true; // By default assume more rows there.
+    ObserverContext<RegionCoprocessorEnvironment> ctx = null;
+    for (RegionEnvironment env : coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        ctx = ObserverContext.createAndPrepare(env, ctx);
+        try {
+          hasMore = ((RegionObserver) env.getInstance()).postScannerFilterRow(ctx, s, currentRow,
+              hasMore);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env, e);
+        }
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+    return hasMore;
+  }
+ 
   /**
    * @param s the scanner
    * @return true if default behavior should be bypassed, false otherwise
@@ -1261,4 +1459,84 @@ public class RegionCoprocessorHost
       }
     }
   }
+
+  /**
+   * @param familyPaths pairs of { CF, file path } submitted for bulk load
+   * @return true if the default operation should be bypassed
+   * @throws IOException
+   */
+  public boolean preBulkLoadHFile(List<Pair<byte[], String>> familyPaths) throws IOException {
+    boolean bypass = false;
+    ObserverContext<RegionCoprocessorEnvironment> ctx = null;
+    for (RegionEnvironment env: coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        ctx = ObserverContext.createAndPrepare(env, ctx);
+        try {
+          ((RegionObserver)env.getInstance()).preBulkLoadHFile(ctx, familyPaths);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env, e);
+        }
+        bypass |= ctx.shouldBypass();
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+
+    return bypass;
+  }
+
+  /**
+   * @param familyPaths pairs of { CF, file path } submitted for bulk load
+   * @param hasLoaded whether load was successful or not
+   * @return the possibly modified value of hasLoaded
+   * @throws IOException
+   */
+  public boolean postBulkLoadHFile(List<Pair<byte[], String>> familyPaths, boolean hasLoaded)
+      throws IOException {
+    ObserverContext<RegionCoprocessorEnvironment> ctx = null;
+    for (RegionEnvironment env: coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        ctx = ObserverContext.createAndPrepare(env, ctx);
+        try {
+          hasLoaded = ((RegionObserver)env.getInstance()).postBulkLoadHFile(ctx,
+            familyPaths, hasLoaded);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env, e);
+        }
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+
+    return hasLoaded;
+  }
+  
+  public void preLockRow(byte[] regionName, byte[] row) throws IOException {
+    ObserverContext<RegionCoprocessorEnvironment> ctx = null;
+    for (RegionEnvironment env : coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        ctx = ObserverContext.createAndPrepare(env, ctx);
+        ((RegionObserver) env.getInstance()).preLockRow(ctx, regionName, row);
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+  }
+
+  public void preUnLockRow(byte[] regionName, long lockId) throws IOException {
+    ObserverContext<RegionCoprocessorEnvironment> ctx = null;
+    for (RegionEnvironment env : coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        ctx = ObserverContext.createAndPrepare(env, ctx);
+        ((RegionObserver) env.getInstance()).preUnlockRow(ctx, regionName, lockId);
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+  }
+
 }

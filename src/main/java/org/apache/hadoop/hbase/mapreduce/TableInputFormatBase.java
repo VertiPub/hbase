@@ -20,6 +20,7 @@
 package org.apache.hadoop.hbase.mapreduce;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -30,13 +31,16 @@ import javax.naming.NamingException;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HServerAddress;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
+import org.apache.hadoop.hbase.util.Addressing;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.hbase.util.Strings;
 import org.apache.hadoop.mapreduce.InputFormat;
 import org.apache.hadoop.mapreduce.InputSplit;
 import org.apache.hadoop.mapreduce.JobContext;
@@ -124,6 +128,11 @@ extends InputFormat<ImmutableBytesWritable, Result> {
     sc.setStopRow(tSplit.getEndRow());
     trr.setScan(sc);
     trr.setHTable(table);
+    try {
+      trr.initialize(tSplit, context);
+    } catch (InterruptedException e) {
+      throw new InterruptedIOException(e.getMessage());
+    }
     return trr;
   }
 
@@ -149,7 +158,17 @@ extends InputFormat<ImmutableBytesWritable, Result> {
     Pair<byte[][], byte[][]> keys = table.getStartEndKeys();
     if (keys == null || keys.getFirst() == null ||
         keys.getFirst().length == 0) {
-      throw new IOException("Expecting at least one region.");
+      HRegionLocation regLoc = table.getRegionLocation(
+          HConstants.EMPTY_BYTE_ARRAY, false);
+      if (null == regLoc) {
+        throw new IOException("Expecting at least one region.");
+      }
+      List<InputSplit> splits = new ArrayList<InputSplit>(1);
+      InputSplit split = new TableSplit(table.getTableName(),
+          HConstants.EMPTY_BYTE_ARRAY, HConstants.EMPTY_BYTE_ARRAY, regLoc
+              .getHostnamePort().split(Addressing.HOSTNAME_PORT_SEPARATOR)[0]);
+      splits.add(split);
+      return splits;
     }
     List<InputSplit> splits = new ArrayList<InputSplit>(keys.getFirst().length);
     for (int i = 0; i < keys.getFirst().length; i++) {
@@ -197,7 +216,7 @@ extends InputFormat<ImmutableBytesWritable, Result> {
   private String reverseDNS(InetAddress ipAddress) throws NamingException {
     String hostName = this.reverseDNSCacheMap.get(ipAddress);
     if (hostName == null) {
-      hostName = DNS.reverseDns(ipAddress, this.nameServer);
+      hostName = Strings.domainNamePointerToHostName(DNS.reverseDns(ipAddress, this.nameServer));
       this.reverseDNSCacheMap.put(ipAddress, hostName);
     }
     return hostName;

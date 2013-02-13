@@ -21,6 +21,7 @@ package org.apache.hadoop.hbase.client.coprocessor;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.client.Row;
 import org.apache.hadoop.hbase.io.HbaseObjectWritable;
 import org.apache.hadoop.hbase.ipc.CoprocessorProtocol;
@@ -61,10 +62,17 @@ public class Exec extends Invocation implements Row {
   }
 
   public Exec(Configuration configuration,
+      Class<? extends CoprocessorProtocol> protocol,
+      Method method, Object[] parameters) {
+    this(configuration, HConstants.EMPTY_BYTE_ARRAY,
+        protocol, method, parameters);
+  }
+
+  public Exec(Configuration configuration,
       byte[] row,
       Class<? extends CoprocessorProtocol> protocol,
       Method method, Object[] parameters) {
-    super(method, parameters);
+    super(method, protocol, parameters);
     this.conf = configuration;
     this.referenceRow = row;
     this.protocol = protocol;

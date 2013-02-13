@@ -42,8 +42,10 @@ import org.apache.hadoop.hbase.DroppedSnapshotException;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.RemoteExceptionHandler;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.HasThread;
 import org.apache.hadoop.util.StringUtils;
+import org.cliffc.high_scale_lib.Counter;
 
 import com.google.common.base.Preconditions;
 
@@ -82,6 +84,7 @@ class MemStoreFlusher extends HasThread implements FlushRequester {
     "hbase.regionserver.global.memstore.lowerLimit";
   private long blockingStoreFilesNumber;
   private long blockingWaitTime;
+  private final Counter updatesBlockedMsHighWater = new Counter();
 
   /**
    * @param conf
@@ -142,6 +145,10 @@ class MemStoreFlusher extends HasThread implements FlushRequester {
       effectiveLimit = defaultLimit;
     }
     return (long)(max * effectiveLimit);
+  }
+
+  public Counter getUpdatesBlockedMsHighWater() {
+    return this.updatesBlockedMsHighWater;
   }
 
   /**
@@ -360,7 +367,13 @@ class MemStoreFlusher extends HasThread implements FlushRequester {
           LOG.warn("Region " + region.getRegionNameAsString() + " has too many " +
             "store files; delaying flush up to " + this.blockingWaitTime + "ms");
           if (!this.server.compactSplitThread.requestSplit(region)) {
-            this.server.compactSplitThread.requestCompaction(region, getName());
+            try {
+              this.server.compactSplitThread.requestCompaction(region, getName());
+            }  catch (IOException e) {
+              LOG.error("Cache flush failed" +
+                (region != null ? (" for region " + Bytes.toStringBinary(region.getRegionName())) : ""),
+                RemoteExceptionHandler.checkIOException(e));
+            }
           }
         }
 
@@ -444,11 +457,22 @@ class MemStoreFlusher extends HasThread implements FlushRequester {
    * to the lower limit. This method blocks callers until we're down to a safe
    * amount of memstore consumption.
    */
-  public synchronized void reclaimMemStoreMemory() {
+  public void reclaimMemStoreMemory() {
     if (isAboveHighWaterMark()) {
       lock.lock();
       try {
+        boolean blocked = false;
+        long startTime = 0;
         while (isAboveHighWaterMark() && !server.isStopped()) {
+          if(!blocked){
+            startTime = EnvironmentEdgeManager.currentTimeMillis();
+            LOG.info("Blocking updates on " + server.toString() +
+            ": the global memstore size " +
+            StringUtils.humanReadableInt(server.getRegionServerAccounting().getGlobalMemstoreSize()) +
+            " is >= than blocking " +
+            StringUtils.humanReadableInt(globalMemStoreLimit) + " size");
+          }
+          blocked = true;
           wakeupFlushThread();
           try {
             // we should be able to wait forever, but we've seen a bug where
@@ -458,6 +482,13 @@ class MemStoreFlusher extends HasThread implements FlushRequester {
             Thread.currentThread().interrupt();
           }
         }
+        if(blocked){
+          final long totalTime = EnvironmentEdgeManager.currentTimeMillis() - startTime;
+          if(totalTime > 0){
+            this.updatesBlockedMsHighWater.add(totalTime);
+          }
+          LOG.info("Unblocking updates for server " + server.toString());
+        }
       } finally {
         lock.unlock();
       }
@@ -466,6 +497,26 @@ class MemStoreFlusher extends HasThread implements FlushRequester {
     }
   }
 
+  @Override
+  public String toString() {
+    return "flush_queue="
+        + flushQueue.size();
+  }
+  
+  public String dumpQueue() {
+    StringBuilder queueList = new StringBuilder();
+    queueList.append("Flush Queue Queue dump:\n");
+    queueList.append("  Flush Queue:\n");
+    java.util.Iterator<FlushQueueEntry> it = flushQueue.iterator();
+    
+    while(it.hasNext()){
+      queueList.append("    "+it.next().toString());
+      queueList.append("\n");
+    }
+    
+    return queueList.toString();
+  }
+  
   interface FlushQueueEntry extends Delayed {}
 
   /**

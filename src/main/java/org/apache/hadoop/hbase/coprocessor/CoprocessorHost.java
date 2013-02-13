@@ -20,6 +20,8 @@
 
 package org.apache.hadoop.hbase.coprocessor;
 
+import com.google.common.collect.MapMaker;
+
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -43,8 +45,8 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.URL;
-import java.net.URLClassLoader;
 import java.util.*;
+import java.util.concurrent.ConcurrentMap;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 
@@ -56,13 +58,19 @@ import java.util.jar.JarFile;
  */
 public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
   public static final String REGION_COPROCESSOR_CONF_KEY =
-      "hbase.coprocessor.region.classes";
+    "hbase.coprocessor.region.classes";
+  public static final String REGIONSERVER_COPROCESSOR_CONF_KEY =
+    "hbase.coprocessor.regionserver.classes";
   public static final String USER_REGION_COPROCESSOR_CONF_KEY =
-      "hbase.coprocessor.user.region.classes";
+    "hbase.coprocessor.user.region.classes";
   public static final String MASTER_COPROCESSOR_CONF_KEY =
-      "hbase.coprocessor.master.classes";
+    "hbase.coprocessor.master.classes";
   public static final String WAL_COPROCESSOR_CONF_KEY =
     "hbase.coprocessor.wal.classes";
+
+  //coprocessor jars are put under ${hbase.local.dir}/coprocessor/jars/
+  private static final String COPROCESSOR_JARS_DIR = File.separator
+      + "coprocessor" + File.separator + "jars" + File.separator;
 
   private static final Log LOG = LogFactory.getLog(CoprocessorHost.class);
   /** Ordered set of loaded coprocessors with lock */
@@ -72,6 +80,15 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
   // unique file prefix to use for local copies of jars when classloading
   protected String pathPrefix;
   protected volatile int loadSequence;
+
+  /*
+   * External classloaders cache keyed by external jar path.
+   * ClassLoader instance is stored as a weak-reference
+   * to allow GC'ing when no CoprocessorHost is using it
+   * (@see HBASE-7205)
+   */
+  static ConcurrentMap<Path, ClassLoader> classLoadersCache =
+      new MapMaker().concurrencyLevel(3).weakValues().makeMap();
 
   public CoprocessorHost() {
     pathPrefix = UUID.randomUUID().toString();
@@ -157,29 +174,48 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
   public E load(Path path, String className, int priority,
       Configuration conf) throws IOException {
     Class<?> implClass = null;
+    LOG.debug("Loading coprocessor class " + className + " with path " + 
+        path + " and priority " + priority);
 
-    // Have we already loaded the class, perhaps from an earlier region open
-    // for the same table?
-    try {
-      implClass = getClass().getClassLoader().loadClass(className);
-    } catch (ClassNotFoundException e) {
-      LOG.info("Class " + className + " needs to be loaded from a file - " +
-          path.toString() + ".");
-      // go ahead to load from file system.
+    ClassLoader cl = null;
+    if (path == null) {
+      try {
+        implClass = getClass().getClassLoader().loadClass(className);
+      } catch (ClassNotFoundException e) {
+        throw new IOException("No jar path specified for " + className);
+      }
+    } else {
+      // Have we already loaded the class, perhaps from an earlier region open
+      // for the same table?
+      cl = classLoadersCache.get(path);
+      if (cl != null){
+        LOG.debug("Found classloader "+ cl + "for "+path.toString());
+        try {
+          implClass = cl.loadClass(className);
+        } catch (ClassNotFoundException e) {
+          LOG.info("Class " + className + " needs to be loaded from a file - " +
+              path + ".");
+          // go ahead to load from file system.
+        }
+      }
     }
 
     // If not, load
     if (implClass == null) {
+      if (path == null) {
+        throw new IOException("No jar path specified for " + className);
+      }
       // copy the jar to the local filesystem
       if (!path.toString().endsWith(".jar")) {
         throw new IOException(path.toString() + ": not a jar file?");
       }
-      FileSystem fs = path.getFileSystem(HBaseConfiguration.create());
-      Path dst = new Path(System.getProperty("java.io.tmpdir") +
-          java.io.File.separator +"." + pathPrefix +
+      FileSystem fs = path.getFileSystem(this.conf);
+      File parentDir = new File(this.conf.get("hbase.local.dir") + COPROCESSOR_JARS_DIR);
+      parentDir.mkdirs();
+      File dst = new File(parentDir, "." + pathPrefix +
           "." + className + "." + System.currentTimeMillis() + ".jar");
-      fs.copyToLocalFile(path, dst);
-      fs.deleteOnExit(dst);
+      fs.copyToLocalFile(path, new Path(dst.toString()));
+      dst.deleteOnExit();
 
       // TODO: code weaving goes here
 
@@ -189,42 +225,54 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
          aborts runaway user code */
 
       // load the jar and get the implementation main class
-      String cp = System.getProperty("java.class.path");
       // NOTE: Path.toURL is deprecated (toURI instead) but the URLClassLoader
       // unsurprisingly wants URLs, not URIs; so we will use the deprecated
       // method which returns URLs for as long as it is available
       List<URL> paths = new ArrayList<URL>();
-      paths.add(new File(dst.toString()).getCanonicalFile().toURL());
+      URL url = dst.getCanonicalFile().toURL();
+      paths.add(url);
 
       JarFile jarFile = new JarFile(dst.toString());
       Enumeration<JarEntry> entries = jarFile.entries();
       while (entries.hasMoreElements()) {
         JarEntry entry = entries.nextElement();
         if (entry.getName().matches("/lib/[^/]+\\.jar")) {
-          File file = new File(System.getProperty("java.io.tmpdir") +
-              java.io.File.separator +"." + pathPrefix +
+          File file = new File(parentDir, "." + pathPrefix +
               "." + className + "." + System.currentTimeMillis() + "." + entry.getName().substring(5));
           IOUtils.copyBytes(jarFile.getInputStream(entry), new FileOutputStream(file), conf, true);
           file.deleteOnExit();
           paths.add(file.toURL());
         }
       }
+      jarFile.close();
 
-      StringTokenizer st = new StringTokenizer(cp, File.pathSeparator);
-      while (st.hasMoreTokens()) {
-        paths.add((new File(st.nextToken())).getCanonicalFile().toURL());
+      cl = new CoprocessorClassLoader(paths, this.getClass().getClassLoader());
+      // cache cp classloader as a weak value, will be GC'ed when no reference left
+      ClassLoader prev = classLoadersCache.putIfAbsent(path, cl);
+      if (prev != null) {
+        //lost update race, use already added classloader
+        cl = prev;
       }
-      ClassLoader cl = new URLClassLoader(paths.toArray(new URL[]{}),
-        this.getClass().getClassLoader());
-      Thread.currentThread().setContextClassLoader(cl);
+
       try {
         implClass = cl.loadClass(className);
       } catch (ClassNotFoundException e) {
-        throw new IOException(e);
+        throw new IOException("Cannot load external coprocessor class " + className, e);
       }
     }
 
-    return loadInstance(implClass, priority, conf);
+    //load custom code for coprocessor
+    Thread currentThread = Thread.currentThread();
+    ClassLoader hostClassLoader = currentThread.getContextClassLoader();
+    try{
+      // switch temporarily to the thread classloader for custom CP
+      currentThread.setContextClassLoader(cl);
+      E cpInstance = loadInstance(implClass, priority, conf);
+      return cpInstance;
+    } finally {
+      // restore the fresh (host) classloader
+      currentThread.setContextClassLoader(hostClassLoader);
+    }
   }
 
   /**
@@ -298,6 +346,24 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
       }
     }
     return null;
+  }
+
+  /**
+   * Retrieves the set of classloaders used to instantiate Coprocessor classes defined in external
+   * jar files.
+   * @return A set of ClassLoader instances
+   */
+  Set<ClassLoader> getExternalClassLoaders() {
+    Set<ClassLoader> externalClassLoaders = new HashSet<ClassLoader>();
+    final ClassLoader systemClassLoader = this.getClass().getClassLoader();
+    for (E env : coprocessors) {
+      ClassLoader cl = env.getInstance().getClass().getClassLoader();
+      if (cl != systemClassLoader ){
+        //do not include system classloader
+        externalClassLoaders.add(cl);
+      }
+    }
+    return externalClassLoaders;
   }
 
   /**
@@ -474,11 +540,17 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
         return tableName;
       }
 
+      /**
+       * @deprecated {@link RowLock} and associated operations are deprecated.
+       */
       public RowLock lockRow(byte[] row) throws IOException {
         throw new RuntimeException(
           "row locking is not allowed within the coprocessor environment");
       }
 
+      /**
+       * @deprecated {@link RowLock} and associated operations are deprecated.
+       */
       public void unlockRow(RowLock rl) throws IOException {
         throw new RuntimeException(
           "row locking is not allowed within the coprocessor environment");
@@ -524,6 +596,26 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
       @Override
       public void mutateRow(RowMutations rm) throws IOException {
         table.mutateRow(rm);
+      }
+
+      @Override
+      public void setAutoFlush(boolean autoFlush) {
+        table.setAutoFlush(autoFlush);
+      }
+
+      @Override
+      public void setAutoFlush(boolean autoFlush, boolean clearBufferOnFail) {
+        table.setAutoFlush(autoFlush, clearBufferOnFail);
+      }
+
+      @Override
+      public long getWriteBufferSize() {
+         return table.getWriteBufferSize();
+      }
+
+      @Override
+      public void setWriteBufferSize(long writeBufferSize) throws IOException {
+        table.setWriteBufferSize(writeBufferSize);
       }
     }
 

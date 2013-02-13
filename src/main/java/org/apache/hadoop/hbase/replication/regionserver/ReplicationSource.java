@@ -22,6 +22,7 @@ package org.apache.hadoop.hbase.replication.regionserver;
 import java.io.EOFException;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.net.ConnectException;
 import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -105,8 +106,6 @@ public class ReplicationSource extends Thread
   private int replicationQueueNbCapacity;
   // Our reader for the current log
   private HLog.Reader reader;
-  // Current position in the log
-  private long position = 0;
   // Last position in the log that we sent to ZooKeeper
   private long lastLoggedPosition = -1;
   // Path of the current log
@@ -132,10 +131,15 @@ public class ReplicationSource extends Thread
   private int currentNbEntries = 0;
   // Current number of operations (Put/Delete) that we need to replicate
   private int currentNbOperations = 0;
+  // Current size of data we need to replicate
+  private int currentSize = 0;
   // Indicates if this particular source is running
   private volatile boolean running = true;
   // Metrics for this source
   private ReplicationSourceMetrics metrics;
+  // Handle on the log reader helper
+  private ReplicationHLogReaderManager repLogReader;
+
 
   /**
    * Instantiation method used by region servers
@@ -183,10 +187,9 @@ public class ReplicationSource extends Thread
         this.conf.getLong("replication.source.sleepforretries", 1000);
     this.fs = fs;
     this.metrics = new ReplicationSourceMetrics(peerClusterZnode);
-
+    this.repLogReader = new ReplicationHLogReaderManager(this.fs, this.conf);
     try {
-      this.clusterId = UUID.fromString(ClusterId.readClusterIdZNode(zkHelper
-          .getZookeeperWatcher()));
+      this.clusterId = zkHelper.getUUIDForCluster(zkHelper.getZookeeperWatcher());
     } catch (KeeperException ke) {
       throw new IOException("Could not read cluster id", ke);
     }
@@ -245,27 +248,32 @@ public class ReplicationSource extends Thread
     if (!this.isActive()) {
       return;
     }
+    int sleepMultiplier = 1;
     // delay this until we are in an asynchronous thread
-    try {
-      this.peerClusterId = UUID.fromString(ClusterId
-          .readClusterIdZNode(zkHelper.getPeerClusters().get(peerId).getZkw()));
-    } catch (KeeperException ke) {
-      this.terminate("Could not read peer's cluster id", ke);
+    while (this.peerClusterId == null) {
+      this.peerClusterId = zkHelper.getPeerUUID(this.peerId);
+      if (this.peerClusterId == null) {
+        if (sleepForRetries("Cannot contact the peer's zk ensemble", sleepMultiplier)) {
+          sleepMultiplier++;
+        }
+      }
     }
+    // resetting to 1 to reuse later
+    sleepMultiplier = 1;
+
     LOG.info("Replicating "+clusterId + " -> " + peerClusterId);
 
     // If this is recovered, the queue is already full and the first log
     // normally has a position (unless the RS failed between 2 logs)
     if (this.queueRecovered) {
       try {
-        this.position = this.zkHelper.getHLogRepPosition(
-            this.peerClusterZnode, this.queue.peek().getName());
+        this.repLogReader.setPosition(this.zkHelper.getHLogRepPosition(
+            this.peerClusterZnode, this.queue.peek().getName()));
       } catch (KeeperException e) {
         this.terminate("Couldn't get the position of this recovered queue " +
             peerClusterZnode, e);
       }
     }
-    int sleepMultiplier = 1;
     // Loop until we close down
     while (isActive()) {
       // Sleep until replication is enabled again
@@ -275,12 +283,31 @@ public class ReplicationSource extends Thread
         }
         continue;
       }
+      Path oldPath = getCurrentPath(); //note that in the current scenario,
+                                       //oldPath will be null when a log roll
+                                       //happens.
       // Get a new path
-      if (!getNextPath()) {
+      boolean hasCurrentPath = getNextPath();
+      if (getCurrentPath() != null && oldPath == null) {
+        sleepMultiplier = 1; //reset the sleepMultiplier on a path change
+      }
+      if (!hasCurrentPath) {
         if (sleepForRetries("No log to process", sleepMultiplier)) {
           sleepMultiplier++;
         }
         continue;
+      }
+      boolean currentWALisBeingWrittenTo = false;
+      //For WAL files we own (rather than recovered), take a snapshot of whether the
+      //current WAL file (this.currentPath) is in use (for writing) NOW!
+      //Since the new WAL paths are enqueued only after the prev WAL file
+      //is 'closed', presence of an element in the queue means that
+      //the previous WAL file was closed, else the file is in use (currentPath)
+      //We take the snapshot now so that we are protected against races
+      //where a new file gets enqueued while the current file is being processed
+      //(and where we just finished reading the current file).
+      if (!this.queueRecovered && queue.size() == 0) {
+        currentWALisBeingWrittenTo = true;
       }
       // Open a reader on it
       if (!openReader(sleepMultiplier)) {
@@ -299,8 +326,9 @@ public class ReplicationSource extends Thread
 
       boolean gotIOE = false;
       currentNbEntries = 0;
+      currentSize = 0;
       try {
-        if(readAllEntriesToReplicateOrNextFile()) {
+        if (readAllEntriesToReplicateOrNextFile(currentWALisBeingWrittenTo)) {
           continue;
         }
       } catch (IOException ioe) {
@@ -334,13 +362,7 @@ public class ReplicationSource extends Thread
         }
       } finally {
         try {
-          // if current path is null, it means we processEndOfFile hence
-          if (this.currentPath != null && !gotIOE) {
-            this.position = this.reader.getPosition();
-          }
-          if (this.reader != null) {
-            this.reader.close();
-          }
+          this.repLogReader.closeReader();
         } catch (IOException e) {
           gotIOE = true;
           LOG.warn("Unable to finalize the tailing of a file", e);
@@ -351,10 +373,10 @@ public class ReplicationSource extends Thread
       // wait a bit and retry.
       // But if we need to stop, don't bother sleeping
       if (this.isActive() && (gotIOE || currentNbEntries == 0)) {
-        if (this.lastLoggedPosition != this.position) {
+        if (this.lastLoggedPosition != this.repLogReader.getPosition()) {
           this.manager.logPositionAndCleanOldLogs(this.currentPath,
-              this.peerClusterZnode, this.position, queueRecovered);
-          this.lastLoggedPosition = this.position;
+              this.peerClusterZnode, this.repLogReader.getPosition(), queueRecovered, currentWALisBeingWrittenTo);
+          this.lastLoggedPosition = this.repLogReader.getPosition();
         }
         if (sleepForRetries("Nothing to replicate", sleepMultiplier)) {
           sleepMultiplier++;
@@ -362,7 +384,7 @@ public class ReplicationSource extends Thread
         continue;
       }
       sleepMultiplier = 1;
-      shipEdits();
+      shipEdits(currentWALisBeingWrittenTo);
 
     }
     if (this.conn != null) {
@@ -378,16 +400,17 @@ public class ReplicationSource extends Thread
   /**
    * Read all the entries from the current log files and retain those
    * that need to be replicated. Else, process the end of the current file.
+   * @param currentWALisBeingWrittenTo is the current WAL being written to
    * @return true if we got nothing and went to the next file, false if we got
    * entries
    * @throws IOException
    */
-  protected boolean readAllEntriesToReplicateOrNextFile() throws IOException{
+  protected boolean readAllEntriesToReplicateOrNextFile(boolean currentWALisBeingWrittenTo)
+      throws IOException{
     long seenEntries = 0;
-    if (this.position != 0) {
-      this.reader.seek(this.position);
-    }
-    HLog.Entry entry = this.reader.next(this.entriesArray[currentNbEntries]);
+    this.repLogReader.seek();
+    HLog.Entry entry =
+        this.repLogReader.readNextAndSetPosition(this.entriesArray, this.currentNbEntries);
     while (entry != null) {
       WALEdit edit = entry.getEdit();
       this.metrics.logEditsReadRate.inc(1);
@@ -411,21 +434,29 @@ public class ReplicationSource extends Thread
           }
           currentNbOperations += countDistinctRowKeys(edit);
           currentNbEntries++;
+          currentSize += entry.getEdit().heapSize();
         } else {
           this.metrics.logEditsFilteredRate.inc(1);
         }
       }
       // Stop if too many entries or too big
-      if ((this.reader.getPosition() - this.position)
-          >= this.replicationQueueSizeCapacity ||
+      if (currentSize >= this.replicationQueueSizeCapacity ||
           currentNbEntries >= this.replicationQueueNbCapacity) {
         break;
       }
-      entry = this.reader.next(entriesArray[currentNbEntries]);
+      try {
+        entry = this.repLogReader.readNextAndSetPosition(this.entriesArray, this.currentNbEntries);
+      } catch (IOException ie) {
+        LOG.debug("Break on IOE: " + ie.getMessage());
+        break;
+      }
     }
     LOG.debug("currentNbOperations:" + currentNbOperations +
         " and seenEntries:" + seenEntries +
-        " and size: " + (this.reader.getPosition() - this.position));
+        " and size: " + this.currentSize);
+    if (currentWALisBeingWrittenTo) {
+      return false;
+    }
     // If we didn't get anything and the queue has an object, it means we
     // hit the end of the file for sure
     return seenEntries == 0 && processEndOfFile();
@@ -469,10 +500,9 @@ public class ReplicationSource extends Thread
   protected boolean openReader(int sleepMultiplier) {
     try {
       LOG.debug("Opening log for replication " + this.currentPath.getName() +
-          " at " + this.position);
+          " at " + this.repLogReader.getPosition());
       try {
-       this.reader = null;
-       this.reader = HLog.getReader(this.fs, this.currentPath, this.conf);
+        this.reader = repLogReader.openReader(this.currentPath);
       } catch (FileNotFoundException fnfe) {
         if (this.queueRecovered) {
           // We didn't find the log in the archive directory, look if it still
@@ -525,6 +555,7 @@ public class ReplicationSource extends Thread
       }
     } catch (IOException ioe) {
       LOG.warn(peerClusterZnode + " Got: ", ioe);
+      this.reader = null;
       // TODO Need a better way to determinate if a file is really gone but
       // TODO without scanning all logs dir
       if (sleepMultiplier == this.maxRetriesMultiplier) {
@@ -588,8 +619,10 @@ public class ReplicationSource extends Thread
 
   /**
    * Do the shipping logic
+   * @param currentWALisBeingWrittenTo was the current WAL being (seemingly) 
+   * written to when this method was called
    */
-  protected void shipEdits() {
+  protected void shipEdits(boolean currentWALisBeingWrittenTo) {
     int sleepMultiplier = 1;
     if (this.currentNbEntries == 0) {
       LOG.warn("Was given 0 edits to ship");
@@ -606,17 +639,17 @@ public class ReplicationSource extends Thread
         HRegionInterface rrs = getRS();
         LOG.debug("Replicating " + currentNbEntries);
         rrs.replicateLogEntries(Arrays.copyOf(this.entriesArray, currentNbEntries));
-        if (this.lastLoggedPosition != this.position) {
+        if (this.lastLoggedPosition != this.repLogReader.getPosition()) {
           this.manager.logPositionAndCleanOldLogs(this.currentPath,
-              this.peerClusterZnode, this.position, queueRecovered);
-          this.lastLoggedPosition = this.position;
+              this.peerClusterZnode, this.repLogReader.getPosition(), queueRecovered, currentWALisBeingWrittenTo);
+          this.lastLoggedPosition = this.repLogReader.getPosition();
         }
         this.totalReplicatedEdits += currentNbEntries;
         this.metrics.shippedBatchesRate.inc(1);
         this.metrics.shippedOpsRate.inc(
             this.currentNbOperations);
         this.metrics.setAgeOfLastShippedOp(
-            this.entriesArray[this.entriesArray.length-1].getKey().getWriteTime());
+            this.entriesArray[currentNbEntries-1].getKey().getWriteTime());
         LOG.debug("Replicated in total: " + this.totalReplicatedEdits);
         break;
 
@@ -631,10 +664,13 @@ public class ReplicationSource extends Thread
             // This exception means we waited for more than 60s and nothing
             // happened, the cluster is alive and calling it right away
             // even for a test just makes things worse.
-            sleepForRetries("Encountered a SocketTimeoutException. Since the" +
+            sleepForRetries("Encountered a SocketTimeoutException. Since the " +
               "call to the remote cluster timed out, which is usually " +
               "caused by a machine failure or a massive slowdown",
               this.socketTimeoutMultiplier);
+          } else if (ioe instanceof ConnectException) {
+            LOG.warn("Peer is unavailable, rechecking all sinks: ", ioe);
+            chooseSinks();
           } else {
             LOG.warn("Can't replicate because of a local or network error: ", ioe);
           }
@@ -679,7 +715,8 @@ public class ReplicationSource extends Thread
   protected boolean processEndOfFile() {
     if (this.queue.size() != 0) {
       this.currentPath = null;
-      this.position = 0;
+      this.repLogReader.finishCurrentFile();
+      this.reader = null;
       return true;
     } else if (this.queueRecovered) {
       this.manager.closeRecoveredQueue(this);
@@ -717,7 +754,10 @@ public class ReplicationSource extends Thread
           + " because an error occurred: " + reason, cause);
     }
     this.running = false;
-    Threads.shutdown(this, this.sleepForRetries);
+    // Only wait for the thread to die if it's not us
+    if (!Thread.currentThread().equals(this)) {
+      Threads.shutdown(this, this.sleepForRetries);
+    }
   }
 
   /**

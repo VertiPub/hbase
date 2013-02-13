@@ -51,7 +51,9 @@ import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValue.KVComparator;
 import org.apache.hadoop.hbase.RemoteExceptionHandler;
+import org.apache.hadoop.hbase.backup.HFileArchiver;
 import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.fs.HFileSystem;
 import org.apache.hadoop.hbase.io.HeapSize;
 import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.io.hfile.Compression;
@@ -62,7 +64,6 @@ import org.apache.hadoop.hbase.io.hfile.HFileScanner;
 import org.apache.hadoop.hbase.io.hfile.InvalidHFileException;
 import org.apache.hadoop.hbase.io.hfile.NoOpDataBlockEncoder;
 import org.apache.hadoop.hbase.monitoring.MonitoredTask;
-import org.apache.hadoop.hbase.regionserver.StoreScanner.ScanType;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactSelection;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionProgress;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionRequest;
@@ -107,6 +108,7 @@ import com.google.common.collect.Lists;
  */
 public class Store extends SchemaConfigured implements HeapSize {
   static final Log LOG = LogFactory.getLog(Store.class);
+
   protected final MemStore memstore;
   // This stores directory in the filesystem.
   private final Path homedir;
@@ -130,10 +132,13 @@ public class Store extends SchemaConfigured implements HeapSize {
   private volatile long totalUncompressedBytes = 0L;
   private final Object flushLock = new Object();
   final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-  private final String storeNameStr;
-  private CompactionProgress progress;
-  private final int compactionKVMax;
   private final boolean verifyBulkLoads;
+
+  /* The default priority for user-specified compaction requests.
+   * The user gets top priority unless we have blocking compactions. (Pri <= 0)
+   */
+  public static final int PRIORITY_USER = 1;
+  public static final int NO_PRIORITY = Integer.MIN_VALUE;
 
   // not private for testing
   /* package */ScanInfo scanInfo;
@@ -141,7 +146,7 @@ public class Store extends SchemaConfigured implements HeapSize {
    * List of store files inside this store. This is an immutable list that
    * is atomically replaced when its contents change.
    */
-  private ImmutableList<StoreFile> storefiles = null;
+  private volatile ImmutableList<StoreFile> storefiles = null;
 
   List<StoreFile> filesCompacting = Lists.newArrayList();
 
@@ -150,10 +155,6 @@ public class Store extends SchemaConfigured implements HeapSize {
     new CopyOnWriteArraySet<ChangedReadersObserver>();
 
   private final int blocksize;
-  /** Compression algorithm for flush files and minor compaction */
-  private final Compression.Algorithm compression;
-  /** Compression algorithm for major compaction */
-  private final Compression.Algorithm compactionCompression;
   private HFileDataBlockEncoder dataBlockEncoder;
 
   /** Checksum configuration */
@@ -163,6 +164,8 @@ public class Store extends SchemaConfigured implements HeapSize {
   // Comparing KeyValues
   final KeyValue.KVComparator comparator;
 
+  private final Compactor compactor;
+
   /**
    * Constructor
    * @param basedir qualified path under which the region directory lives;
@@ -170,32 +173,23 @@ public class Store extends SchemaConfigured implements HeapSize {
    * @param region
    * @param family HColumnDescriptor for this column
    * @param fs file system object
-   * @param conf configuration object
+   * @param confParam configuration object
    * failed.  Can be null.
    * @throws IOException
    */
   protected Store(Path basedir, HRegion region, HColumnDescriptor family,
     FileSystem fs, Configuration conf)
   throws IOException {
-    super(conf, region.getTableDesc().getNameAsString(),
+    super(conf, region.getRegionInfo().getTableNameAsString(),
         Bytes.toString(family.getName()));
-    HRegionInfo info = region.regionInfo;
+    HRegionInfo info = region.getRegionInfo();
     this.fs = fs;
-    this.homedir = getStoreHomedir(basedir, info.getEncodedName(), family.getName());
-    if (!this.fs.exists(this.homedir)) {
-      if (!this.fs.mkdirs(this.homedir))
-        throw new IOException("Failed create of: " + this.homedir.toString());
-    }
+    Path p = getStoreHomedir(basedir, info.getEncodedName(), family.getName());
+    this.homedir = createStoreHomeDir(this.fs, p);
     this.region = region;
     this.family = family;
     this.conf = conf;
     this.blocksize = family.getBlocksize();
-    this.compression = family.getCompression();
-    // avoid overriding compression setting for major compactions if the user
-    // has not specified it separately
-    this.compactionCompression =
-      (family.getCompactionCompression() != Compression.Algorithm.NONE) ?
-        family.getCompactionCompression() : this.compression;
 
     this.dataBlockEncoder =
         new HFileDataBlockEncoderImpl(family.getDataBlockEncodingOnDisk(),
@@ -218,11 +212,8 @@ public class Store extends SchemaConfigured implements HeapSize {
         Math.max(conf.getLong("hbase.hstore.time.to.purge.deletes", 0), 0);
     LOG.info("time to purge deletes set to " + timeToPurgeDeletes +
         "ms in store " + this);
-    scanInfo = new ScanInfo(family.getName(), family.getMinVersions(),
-        family.getMaxVersions(), ttl, family.getKeepDeletedCells(),
-        timeToPurgeDeletes, this.comparator);
+    scanInfo = new ScanInfo(family, ttl, timeToPurgeDeletes, this.comparator);
     this.memstore = new MemStore(conf, this.comparator);
-    this.storeNameStr = getColumnFamilyName();
 
     // By default, compact if storefile.count >= minFilesToCompact
     this.minFilesToCompact = Math.max(2,
@@ -239,10 +230,8 @@ public class Store extends SchemaConfigured implements HeapSize {
       this.region.memstoreFlushSize);
     this.maxCompactSize
       = conf.getLong("hbase.hstore.compaction.max.size", Long.MAX_VALUE);
-    this.compactionKVMax = conf.getInt("hbase.hstore.compaction.kv.max", 10);
 
-    this.verifyBulkLoads = conf.getBoolean("hbase.hstore.bulkload.verify",
-        false);
+    this.verifyBulkLoads = conf.getBoolean("hbase.hstore.bulkload.verify", false);
 
     if (Store.closeCheckInterval == 0) {
       Store.closeCheckInterval = conf.getInt(
@@ -254,6 +243,47 @@ public class Store extends SchemaConfigured implements HeapSize {
     this.checksumType = getChecksumType(conf);
     // initilize bytes per checksum
     this.bytesPerChecksum = getBytesPerChecksum(conf);
+    // Create a compaction tool instance
+    this.compactor = new Compactor(this.conf);
+  }
+
+  /**
+   * @param family
+   * @return
+   */
+  long getTTL(final HColumnDescriptor family) {
+    // HCD.getTimeToLive returns ttl in seconds.  Convert to milliseconds.
+    long ttl = family.getTimeToLive();
+    if (ttl == HConstants.FOREVER) {
+      // Default is unlimited ttl.
+      ttl = Long.MAX_VALUE;
+    } else if (ttl == -1) {
+      ttl = Long.MAX_VALUE;
+    } else {
+      // Second -> ms adjust for user data
+      ttl *= 1000;
+    }
+    return ttl;
+  }
+
+  /**
+   * Create this store's homedir
+   * @param fs
+   * @param homedir
+   * @return Return <code>homedir</code>
+   * @throws IOException
+   */
+  Path createStoreHomeDir(final FileSystem fs,
+      final Path homedir) throws IOException {
+    if (!fs.exists(homedir)) {
+      if (!fs.mkdirs(homedir))
+        throw new IOException("Failed create of: " + homedir.toString());
+    }
+    return homedir;
+  }
+
+  FileSystem getFileSystem() {
+    return this.fs;
   }
 
   /**
@@ -314,10 +344,10 @@ public class Store extends SchemaConfigured implements HeapSize {
    * Return the directory in which this store stores its
    * StoreFiles
    */
-  public Path getHomedir() {
+  Path getHomedir() {
     return homedir;
   }
-  
+
   /**
    * @return the data block encoder
    */
@@ -333,6 +363,10 @@ public class Store extends SchemaConfigured implements HeapSize {
     this.dataBlockEncoder = blockEncoder;
   }
 
+  FileStatus [] getStoreFiles() throws IOException {
+    return FSUtils.listStatus(this.fs, this.homedir, null);
+  }
+
   /**
    * Creates an unsorted list of StoreFile loaded in parallel
    * from the given directory.
@@ -340,7 +374,7 @@ public class Store extends SchemaConfigured implements HeapSize {
    */
   private List<StoreFile> loadStoreFiles() throws IOException {
     ArrayList<StoreFile> results = new ArrayList<StoreFile>();
-    FileStatus files[] = FSUtils.listStatus(this.fs, this.homedir, null);
+    FileStatus files[] = getStoreFiles();
 
     if (files == null || files.length == 0) {
       return results;
@@ -379,25 +413,37 @@ public class Store extends SchemaConfigured implements HeapSize {
       totalValidStoreFile++;
     }
 
+    IOException ioe = null;
     try {
       for (int i = 0; i < totalValidStoreFile; i++) {
-        Future<StoreFile> future = completionService.take();
-        StoreFile storeFile = future.get();
-        long length = storeFile.getReader().length();
-        this.storeSize += length;
-        this.totalUncompressedBytes +=
-          storeFile.getReader().getTotalUncompressedBytes();
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("loaded " + storeFile.toStringDetailed());
-        }
-        results.add(storeFile);
-      }
-    } catch (InterruptedException e) {
-      throw new IOException(e);
-    } catch (ExecutionException e) {
-      throw new IOException(e.getCause());
+        try {
+          Future<StoreFile> future = completionService.take();
+          StoreFile storeFile = future.get();
+          long length = storeFile.getReader().length();
+          this.storeSize += length;
+          this.totalUncompressedBytes +=
+              storeFile.getReader().getTotalUncompressedBytes();
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("loaded " + storeFile.toStringDetailed());
+          }
+          results.add(storeFile);
+        } catch (InterruptedException e) {
+          if (ioe == null) ioe = new InterruptedIOException(e.getMessage());
+        } catch (ExecutionException e) {
+          if (ioe == null) ioe = new IOException(e.getCause());
+        } 
+      } 
     } finally {
       storeFileOpenerThreadPool.shutdownNow();
+    }
+    if (ioe != null) {
+      // close StoreFile readers
+      try {
+        for (StoreFile file : results) {
+          if (file != null) file.closeReader(true);
+        }
+      } catch (IOException e) { }
+      throw ioe;
     }
 
     return results;
@@ -435,7 +481,7 @@ public class Store extends SchemaConfigured implements HeapSize {
 
   /**
    * Removes a kv from the memstore. The KeyValue is removed only
-   * if its key & memstoreTS matches the key & memstoreTS value of the 
+   * if its key & memstoreTS matches the key & memstoreTS value of the
    * kv parameter.
    *
    * @param kv
@@ -452,7 +498,7 @@ public class Store extends SchemaConfigured implements HeapSize {
   /**
    * @return All store files.
    */
-  List<StoreFile> getStorefiles() {
+  public List<StoreFile> getStorefiles() {
     return this.storefiles;
   }
 
@@ -521,8 +567,8 @@ public class Store extends SchemaConfigured implements HeapSize {
   }
 
   /**
-   * This method should only be called from HRegion.  It is assumed that the 
-   * ranges of values in the HFile fit within the stores assigned region. 
+   * This method should only be called from HRegion.  It is assumed that the
+   * ranges of values in the HFile fit within the stores assigned region.
    * (assertBulkLoadHFileOk checks this)
    */
   void bulkLoadHFile(String srcPathStr) throws IOException {
@@ -530,7 +576,12 @@ public class Store extends SchemaConfigured implements HeapSize {
 
     // Move the file if it's on another filesystem
     FileSystem srcFs = srcPath.getFileSystem(conf);
-    if (!srcFs.equals(fs)) {
+    FileSystem desFs = fs instanceof HFileSystem ? ((HFileSystem)fs).getBackingFs() : fs;
+    //We can't compare FileSystem instances as
+    //equals() includes UGI instance as part of the comparison
+    //and won't work when doing SecureBulkLoad
+    //TODO deal with viewFS
+    if (!srcFs.getUri().equals(desFs.getUri())) {
       LOG.info("File " + srcPath + " on different filesystem than " +
           "destination store - moving to this filesystem.");
       Path tmpPath = getTmpPath();
@@ -547,7 +598,9 @@ public class Store extends SchemaConfigured implements HeapSize {
         this.family.getBloomFilterType(), this.dataBlockEncoder);
     passSchemaMetricsTo(sf);
 
-    sf.createReader();
+    StoreFile.Reader r = sf.createReader();
+    this.storeSize += r.length();
+    this.totalUncompressedBytes += r.getTotalUncompressedBytes();
 
     LOG.info("Moved hfile " + srcPath + " into store directory " +
         homedir + " - updating store file list.");
@@ -602,7 +655,7 @@ public class Store extends SchemaConfigured implements HeapSize {
         ThreadPoolExecutor storeFileCloserThreadPool = this.region
             .getStoreFileOpenAndCloseThreadPool("StoreFileCloserThread-"
                 + this.family.getNameAsString());
-  
+
         // close each store file in parallel
         CompletionService<Void> completionService =
           new ExecutorCompletionService<Void>(storeFileCloserThreadPool);
@@ -614,21 +667,28 @@ public class Store extends SchemaConfigured implements HeapSize {
             }
           });
         }
-  
+
+        IOException ioe = null;
         try {
           for (int i = 0; i < result.size(); i++) {
-            Future<Void> future = completionService.take();
-            future.get();
+            try {
+              Future<Void> future = completionService.take();
+              future.get();
+            } catch (InterruptedException e) {
+              if (ioe == null) {
+                ioe = new InterruptedIOException();
+                ioe.initCause(e);
+              }
+            } catch (ExecutionException e) {
+              if (ioe == null) ioe = new IOException(e.getCause());
+            }
           }
-        } catch (InterruptedException e) {
-          throw new IOException(e);
-        } catch (ExecutionException e) {
-          throw new IOException(e.getCause());
         } finally {
           storeFileCloserThreadPool.shutdownNow();
         }
+        if (ioe != null) throw ioe;
       }
-      LOG.debug("closed " + this.storeNameStr);
+      LOG.info("Closed " + this);
       return result;
     } finally {
       this.lock.writeLock().unlock();
@@ -689,16 +749,32 @@ public class Store extends SchemaConfigured implements HeapSize {
     if (set.size() == 0) {
       return null;
     }
-    Scan scan = new Scan();
-    scan.setMaxVersions(scanInfo.getMaxVersions());
     // Use a store scanner to find which rows to flush.
     // Note that we need to retain deletes, hence
     // treat this as a minor compaction.
-    InternalScanner scanner = new StoreScanner(this, scan, Collections
-        .singletonList(new CollectionBackedScanner(set, this.comparator)),
-        ScanType.MINOR_COMPACT, this.region.getSmallestReadPoint(),
-        HConstants.OLDEST_TIMESTAMP);
+    InternalScanner scanner = null;
+    KeyValueScanner memstoreScanner = new CollectionBackedScanner(set, this.comparator);
+    if (getHRegion().getCoprocessorHost() != null) {
+      scanner = getHRegion().getCoprocessorHost().preFlushScannerOpen(this, memstoreScanner);
+    }
+    if (scanner == null) {
+      Scan scan = new Scan();
+      scan.setMaxVersions(scanInfo.getMaxVersions());
+      scanner = new StoreScanner(this, scanInfo, scan,
+          Collections.singletonList(memstoreScanner), ScanType.MINOR_COMPACT,
+          this.region.getSmallestReadPoint(), HConstants.OLDEST_TIMESTAMP);
+    }
+    if (getHRegion().getCoprocessorHost() != null) {
+      InternalScanner cpScanner =
+        getHRegion().getCoprocessorHost().preFlush(this, scanner);
+      // NULL scanner returned from coprocessor hooks means skip normal processing
+      if (cpScanner == null) {
+        return null;
+      }
+      scanner = cpScanner;
+    }
     try {
+      int compactionKVMax = conf.getInt(HConstants.COMPACTION_KV_MAX, 10);
       // TODO:  We can fail in the below block before we complete adding this
       // flush to list of store files.  Add cleanup of anything put on filesystem
       // if we fail.
@@ -712,7 +788,7 @@ public class Store extends SchemaConfigured implements HeapSize {
           List<KeyValue> kvs = new ArrayList<KeyValue>();
           boolean hasMore;
           do {
-            hasMore = scanner.next(kvs);
+            hasMore = scanner.next(kvs, compactionKVMax);
             if (!kvs.isEmpty()) {
               for (KeyValue kv : kvs) {
                 // If we know that this KV is going to be included always, then let us
@@ -743,7 +819,7 @@ public class Store extends SchemaConfigured implements HeapSize {
       scanner.close();
     }
     if (LOG.isInfoEnabled()) {
-      LOG.info("Flushed " + 
+      LOG.info("Flushed " +
                ", sequenceid=" + logCacheFlushId +
                ", memsize=" + StringUtils.humanReadableInt(flushed) +
                ", into tmp file " + pathName);
@@ -804,7 +880,7 @@ public class Store extends SchemaConfigured implements HeapSize {
    */
   private StoreFile.Writer createWriterInTmp(int maxKeyCount)
   throws IOException {
-    return createWriterInTmp(maxKeyCount, this.compression, false);
+    return createWriterInTmp(maxKeyCount, this.family.getCompression(), false);
   }
 
   /*
@@ -813,7 +889,7 @@ public class Store extends SchemaConfigured implements HeapSize {
    * @param isCompaction whether we are creating a new file in a compaction
    * @return Writer for a new StoreFile in the tmp dir.
    */
-  private StoreFile.Writer createWriterInTmp(int maxKeyCount,
+  public StoreFile.Writer createWriterInTmp(int maxKeyCount,
     Compression.Algorithm compression, boolean isCompaction)
   throws IOException {
     final CacheConfig writerCacheConf;
@@ -954,19 +1030,15 @@ public class Store extends SchemaConfigured implements HeapSize {
    * <p>We don't want to hold the structureLock for the whole time, as a compact()
    * can be lengthy and we want to allow cache-flushes during this period.
    *
-   * @param CompactionRequest
+   * @param cr
    *          compaction details obtained from requestCompaction()
    * @throws IOException
+   * @return Storefile we compacted into or null if we failed or opted out early.
    */
-  void compact(CompactionRequest cr) throws IOException {
-    if (cr == null || cr.getFiles().isEmpty()) {
-      return;
-    }
-    Preconditions.checkArgument(cr.getStore().toString()
-        .equals(this.toString()));
-
+  StoreFile compact(CompactionRequest cr) throws IOException {
+    if (cr == null || cr.getFiles().isEmpty()) return null;
+    Preconditions.checkArgument(cr.getStore().toString().equals(this.toString()));
     List<StoreFile> filesToCompact = cr.getFiles();
-
     synchronized (filesCompacting) {
       // sanity check: we're compacting files that this store knows about
       // TODO: change this to LOG.error() after more debugging
@@ -978,19 +1050,26 @@ public class Store extends SchemaConfigured implements HeapSize {
 
     // Ready to go. Have list of files to compact.
     LOG.info("Starting compaction of " + filesToCompact.size() + " file(s) in "
-        + this.storeNameStr + " of "
+        + this + " of "
         + this.region.getRegionInfo().getRegionNameAsString()
         + " into tmpdir=" + region.getTmpDir() + ", seqid=" + maxId + ", totalSize="
         + StringUtils.humanReadableInt(cr.getSize()));
 
     StoreFile sf = null;
     try {
-      StoreFile.Writer writer = compactStore(filesToCompact, cr.isMajor(),
-          maxId);
+      StoreFile.Writer writer =
+        this.compactor.compact(this, filesToCompact, cr.isMajor(), maxId);
       // Move the compaction into place.
-      sf = completeCompaction(filesToCompact, writer);
-      if (region.getCoprocessorHost() != null) {
-        region.getCoprocessorHost().postCompact(this, sf);
+      if (this.conf.getBoolean("hbase.hstore.compaction.complete", true)) {
+        sf = completeCompaction(filesToCompact, writer);
+        if (region.getCoprocessorHost() != null) {
+          region.getCoprocessorHost().postCompact(this, sf);
+        }
+      } else {
+        // Create storefile around what we wrote with a reader on it.
+        sf = new StoreFile(this.fs, writer.getPath(), this.conf, this.cacheConf,
+          this.family.getBloomFilterType(), this.dataBlockEncoder);
+        sf.createReader();
       }
     } finally {
       synchronized (filesCompacting) {
@@ -999,7 +1078,7 @@ public class Store extends SchemaConfigured implements HeapSize {
     }
 
     LOG.info("Completed" + (cr.isMajor() ? " major " : " ") + "compaction of "
-        + filesToCompact.size() + " file(s) in " + this.storeNameStr + " of "
+        + filesToCompact.size() + " file(s) in " + this + " of "
         + this.region.getRegionInfo().getRegionNameAsString()
         + " into " +
         (sf == null ? "none" : sf.getPath().getName()) +
@@ -1007,6 +1086,7 @@ public class Store extends SchemaConfigured implements HeapSize {
           StringUtils.humanReadableInt(sf.getReader().length()))
         + "; total size for store is "
         + StringUtils.humanReadableInt(storeSize));
+    return sf;
   }
 
   /**
@@ -1046,7 +1126,8 @@ public class Store extends SchemaConfigured implements HeapSize {
 
     try {
       // Ready to go. Have list of files to compact.
-      StoreFile.Writer writer = compactStore(filesToCompact, isMajor, maxId);
+      StoreFile.Writer writer =
+        this.compactor.compact(this, filesToCompact, isMajor, maxId);
       // Move the compaction into place.
       StoreFile sf = completeCompaction(filesToCompact, writer);
       if (region.getCoprocessorHost() != null) {
@@ -1095,10 +1176,10 @@ public class Store extends SchemaConfigured implements HeapSize {
   }
 
   /** getter for CompactionProgress object
-   * @return CompactionProgress object
+   * @return CompactionProgress object; can be null
    */
   public CompactionProgress getCompactionProgress() {
-    return this.progress;
+    return this.compactor.getProgress();
   }
 
   /*
@@ -1150,19 +1231,19 @@ public class Store extends SchemaConfigured implements HeapSize {
         if (sf.isMajorCompaction() &&
             (this.ttl == HConstants.FOREVER || oldest < this.ttl)) {
           if (LOG.isDebugEnabled()) {
-            LOG.debug("Skipping major compaction of " + this.storeNameStr +
+            LOG.debug("Skipping major compaction of " + this +
                 " because one (major) compacted file only and oldestTime " +
                 oldest + "ms is < ttl=" + this.ttl);
           }
         } else if (this.ttl != HConstants.FOREVER && oldest > this.ttl) {
-          LOG.debug("Major compaction triggered on store " + this.storeNameStr +
+          LOG.debug("Major compaction triggered on store " + this +
             ", because keyvalues outdated; time since last major compaction " +
             (now - lowTimestamp) + "ms");
           result = true;
         }
       } else {
         if (LOG.isDebugEnabled()) {
-          LOG.debug("Major compaction triggered on store " + this.storeNameStr +
+          LOG.debug("Major compaction triggered on store " + this +
               "; time since last major compaction " + (now - lowTimestamp) + "ms");
         }
         result = true;
@@ -1187,7 +1268,7 @@ public class Store extends SchemaConfigured implements HeapSize {
       if (jitterPct > 0) {
         long jitter = Math.round(ret * jitterPct);
         // deterministic jitter avoids a major compaction storm on restart
-        ImmutableList<StoreFile> snapshot = storefiles; 
+        ImmutableList<StoreFile> snapshot = storefiles;
         if (snapshot != null && !snapshot.isEmpty()) {
           String seed = snapshot.get(0).getPath().getName();
           double curRand = new Random(seed.hashCode()).nextDouble();
@@ -1200,7 +1281,11 @@ public class Store extends SchemaConfigured implements HeapSize {
     return ret;
   }
 
-  public CompactionRequest requestCompaction() {
+  public CompactionRequest requestCompaction() throws IOException {
+    return requestCompaction(NO_PRIORITY);
+  }
+
+  public CompactionRequest requestCompaction(int priority) throws IOException {
     // don't even select for compaction if writes are disabled
     if (!this.region.areWritesEnabled()) {
       return null;
@@ -1231,7 +1316,7 @@ public class Store extends SchemaConfigured implements HeapSize {
           // coprocessor is overriding normal file selection
           filesToCompact = new CompactSelection(conf, candidates);
         } else {
-          filesToCompact = compactSelection(candidates);
+          filesToCompact = compactSelection(candidates, priority);
         }
 
         if (region.getCoprocessorHost() != null) {
@@ -1261,23 +1346,34 @@ public class Store extends SchemaConfigured implements HeapSize {
         }
 
         // everything went better than expected. create a compaction request
-        int pri = getCompactPriority();
+        int pri = getCompactPriority(priority);
         ret = new CompactionRequest(region, this, filesToCompact, isMajor, pri);
       }
-    } catch (IOException ex) {
-      LOG.error("Compaction Request failed for region " + region + ", store "
-          + this, RemoteExceptionHandler.checkIOException(ex));
     } finally {
       this.lock.readLock().unlock();
+    }
+    if (ret != null) {
+      CompactionRequest.preRequest(ret);
     }
     return ret;
   }
 
   public void finishRequest(CompactionRequest cr) {
+    CompactionRequest.postRequest(cr);
     cr.finishRequest();
     synchronized (filesCompacting) {
       filesCompacting.removeAll(cr.getFiles());
     }
+  }
+
+  /**
+   * Algorithm to choose which files to compact, see {@link #compactSelection(java.util.List, int)}
+   * @param candidates
+   * @return
+   * @throws IOException
+   */
+  CompactSelection compactSelection(List<StoreFile> candidates) throws IOException {
+    return compactSelection(candidates,NO_PRIORITY);
   }
 
   /**
@@ -1299,7 +1395,7 @@ public class Store extends SchemaConfigured implements HeapSize {
    * @return subset copy of candidate list that meets compaction criteria
    * @throws IOException
    */
-  CompactSelection compactSelection(List<StoreFile> candidates)
+  CompactSelection compactSelection(List<StoreFile> candidates, int priority)
       throws IOException {
     // ASSUMPTION!!! filesCompacting is locked when calling this function
 
@@ -1319,7 +1415,7 @@ public class Store extends SchemaConfigured implements HeapSize {
     boolean forcemajor = this.forceMajor && filesCompacting.isEmpty();
     if (!forcemajor) {
       // Delete the expired store files before the compaction selection.
-      if (conf.getBoolean("hbase.store.delete.expired.storefile", false)
+      if (conf.getBoolean("hbase.store.delete.expired.storefile", true)
           && (ttl != Long.MAX_VALUE) && (this.scanInfo.minVersions == 0)) {
         CompactSelection expiredSelection = compactSelection
             .selectExpiredStoreFilesToCompact(
@@ -1337,32 +1433,32 @@ public class Store extends SchemaConfigured implements HeapSize {
              compactSelection.getFilesToCompact().get(pos).getReader().length()
                > maxCompactSize &&
              !compactSelection.getFilesToCompact().get(pos).isReference()) ++pos;
-      compactSelection.clearSubList(0, pos);
+      if (pos != 0) compactSelection.clearSubList(0, pos);
     }
 
     if (compactSelection.getFilesToCompact().isEmpty()) {
       LOG.debug(this.getHRegionInfo().getEncodedName() + " - " +
-        this.storeNameStr + ": no store files to compact");
+        this + ": no store files to compact");
       compactSelection.emptyFileList();
       return compactSelection;
     }
 
-    // major compact on user action or age (caveat: we have too many files)
-    boolean majorcompaction =
-      (forcemajor || isMajorCompaction(compactSelection.getFilesToCompact()))
-      && compactSelection.getFilesToCompact().size() < this.maxFilesToCompact;
+    // Force a major compaction if this is a user-requested major compaction,
+    // or if we do not have too many files to compact and this was requested
+    // as a major compaction
+    boolean majorcompaction = (forcemajor && priority == PRIORITY_USER) ||
+      (forcemajor || isMajorCompaction(compactSelection.getFilesToCompact())) &&
+      (compactSelection.getFilesToCompact().size() < this.maxFilesToCompact
+    );
+    LOG.debug(this.getHRegionInfo().getEncodedName() + " - " +
+      this.getColumnFamilyName() + ": Initiating " +
+      (majorcompaction ? "major" : "minor") + "compaction");
 
     if (!majorcompaction &&
         !hasReferences(compactSelection.getFilesToCompact())) {
       // we're doing a minor compaction, let's see what files are applicable
       int start = 0;
       double r = compactSelection.getCompactSelectionRatio();
-
-      // skip selection algorithm if we don't have enough files
-      if (compactSelection.getFilesToCompact().size() < this.minFilesToCompact) {
-        compactSelection.emptyFileList();
-        return compactSelection;
-      }
 
       // remove bulk import files that request to be excluded from minors
       compactSelection.getFilesToCompact().removeAll(Collections2.filter(
@@ -1372,6 +1468,17 @@ public class Store extends SchemaConfigured implements HeapSize {
               return input.excludeFromMinorCompaction();
             }
           }));
+
+      // skip selection algorithm if we don't have enough files
+      if (compactSelection.getFilesToCompact().size() < this.minFilesToCompact) {
+        if(LOG.isDebugEnabled()) {
+          LOG.debug("Not compacting files because we only have " +
+            compactSelection.getFilesToCompact().size() +
+            " files ready for compaction.  Need " + this.minFilesToCompact + " to initiate.");
+        }
+        compactSelection.emptyFileList();
+        return compactSelection;
+      }
 
       /* TODO: add sorting + unit test back in when HBASE-2856 is fixed
       // Sort files by size to correct when normal skew is altered by bulk load.
@@ -1418,7 +1525,7 @@ public class Store extends SchemaConfigured implements HeapSize {
       // if we don't have enough files to compact, just wait
       if (compactSelection.getFilesToCompact().size() < this.minFilesToCompact) {
         if (LOG.isDebugEnabled()) {
-          LOG.debug("Skipped compaction of " + this.storeNameStr
+          LOG.debug("Skipped compaction of " + this
             + ".  Only " + (end - start) + " file(s) of size "
             + StringUtils.humanReadableInt(totalSize)
             + " have met compaction criteria.");
@@ -1427,150 +1534,21 @@ public class Store extends SchemaConfigured implements HeapSize {
         return compactSelection;
       }
     } else {
-      // all files included in this compaction, up to max
-      if (compactSelection.getFilesToCompact().size() > this.maxFilesToCompact) {
-        int pastMax =
-          compactSelection.getFilesToCompact().size() - this.maxFilesToCompact;
-        compactSelection.clearSubList(0, pastMax);
+      if(majorcompaction) {
+        if (compactSelection.getFilesToCompact().size() > this.maxFilesToCompact) {
+          LOG.debug("Warning, compacting more than " + this.maxFilesToCompact +
+            " files, probably because of a user-requested major compaction");
+          if(priority != PRIORITY_USER) {
+            LOG.error("Compacting more than max files on a non user-requested compaction");
+          }
+        }
+      } else if (compactSelection.getFilesToCompact().size() > this.maxFilesToCompact) {
+        // all files included in this compaction, up to max
+        int pastMax = compactSelection.getFilesToCompact().size() - this.maxFilesToCompact;
+        compactSelection.getFilesToCompact().subList(0, pastMax).clear();
       }
     }
     return compactSelection;
-  }
-
-  /**
-   * Do a minor/major compaction on an explicit set of storefiles in a Store.
-   * Uses the scan infrastructure to make it easy.
-   *
-   * @param filesToCompact which files to compact
-   * @param majorCompaction true to major compact (prune all deletes, max versions, etc)
-   * @param maxId Readers maximum sequence id.
-   * @return Product of compaction or null if all cells expired or deleted and
-   * nothing made it through the compaction.
-   * @throws IOException
-   */
-  StoreFile.Writer compactStore(final Collection<StoreFile> filesToCompact,
-                               final boolean majorCompaction, final long maxId)
-      throws IOException {
-    // calculate maximum key count after compaction (for blooms)
-    int maxKeyCount = 0;
-    long earliestPutTs = HConstants.LATEST_TIMESTAMP;
-    for (StoreFile file : filesToCompact) {
-      StoreFile.Reader r = file.getReader();
-      if (r != null) {
-        // NOTE: getFilterEntries could cause under-sized blooms if the user
-        //       switches bloom type (e.g. from ROW to ROWCOL)
-        long keyCount = (r.getBloomFilterType() == family.getBloomFilterType())
-          ? r.getFilterEntries() : r.getEntries();
-        maxKeyCount += keyCount;
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("Compacting " + file +
-            ", keycount=" + keyCount +
-            ", bloomtype=" + r.getBloomFilterType().toString() +
-            ", size=" + StringUtils.humanReadableInt(r.length()) +
-            ", encoding=" + r.getHFileReader().getEncodingOnDisk());
-        }
-      }
-      // For major compactions calculate the earliest put timestamp
-      // of all involved storefiles. This is used to remove 
-      // family delete marker during the compaction.
-      if (majorCompaction) {
-        byte[] tmp = r.loadFileInfo().get(StoreFile.EARLIEST_PUT_TS);
-        if (tmp == null) {
-          // there's a file with no information, must be an old one
-          // assume we have very old puts
-          earliestPutTs = HConstants.OLDEST_TIMESTAMP;
-        } else {
-          earliestPutTs = Math.min(earliestPutTs, Bytes.toLong(tmp));
-        }
-      }
-    }
-
-    // keep track of compaction progress
-    progress = new CompactionProgress(maxKeyCount);
-
-    // For each file, obtain a scanner:
-    List<StoreFileScanner> scanners = StoreFileScanner
-      .getScannersForStoreFiles(filesToCompact, false, false, true);
-
-    // Make the instantiation lazy in case compaction produces no product; i.e.
-    // where all source cells are expired or deleted.
-    StoreFile.Writer writer = null;
-    // Find the smallest read point across all the Scanners.
-    long smallestReadPoint = region.getSmallestReadPoint();
-    MultiVersionConsistencyControl.setThreadReadPoint(smallestReadPoint);
-    try {
-      InternalScanner scanner = null;
-      try {
-        Scan scan = new Scan();
-        scan.setMaxVersions(family.getMaxVersions());
-        /* include deletes, unless we are doing a major compaction */
-        scanner = new StoreScanner(this, scan, scanners,
-            majorCompaction ? ScanType.MAJOR_COMPACT : ScanType.MINOR_COMPACT,
-            smallestReadPoint, earliestPutTs);
-        if (region.getCoprocessorHost() != null) {
-          InternalScanner cpScanner = region.getCoprocessorHost().preCompact(
-              this, scanner);
-          // NULL scanner returned from coprocessor hooks means skip normal processing
-          if (cpScanner == null) {
-            return null;
-          }
-
-          scanner = cpScanner;
-        }
-
-        int bytesWritten = 0;
-        // since scanner.next() can return 'false' but still be delivering data,
-        // we have to use a do/while loop.
-        ArrayList<KeyValue> kvs = new ArrayList<KeyValue>();
-        // Limit to "hbase.hstore.compaction.kv.max" (default 10) to avoid OOME
-        boolean hasMore;
-        do {
-          hasMore = scanner.next(kvs, this.compactionKVMax);
-          if (writer == null && !kvs.isEmpty()) {
-            writer = createWriterInTmp(maxKeyCount, this.compactionCompression,
-                true);
-          }
-          if (writer != null) {
-            // output to writer:
-            for (KeyValue kv : kvs) {
-              if (kv.getMemstoreTS() <= smallestReadPoint) {
-                kv.setMemstoreTS(0);
-              }
-              writer.append(kv);
-              // update progress per key
-              ++progress.currentCompactedKVs;
-
-              // check periodically to see if a system stop is requested
-              if (Store.closeCheckInterval > 0) {
-                bytesWritten += kv.getLength();
-                if (bytesWritten > Store.closeCheckInterval) {
-                  bytesWritten = 0;
-                  if (!this.region.areWritesEnabled()) {
-                    writer.close();
-                    fs.delete(writer.getPath(), false);
-                    throw new InterruptedIOException(
-                        "Aborting compaction of store " + this +
-                        " in region " + this.region +
-                        " because user requested stop.");
-                  }
-                }
-              }
-            }
-          }
-          kvs.clear();
-        } while (hasMore);
-      } finally {
-        if (scanner != null) {
-          scanner.close();
-        }
-      }
-    } finally {
-      if (writer != null) {
-        writer.appendMetadata(maxId, majorCompaction);
-        writer.close();
-      }
-    }
-    return writer;
   }
 
   /**
@@ -1669,13 +1647,15 @@ public class Store extends SchemaConfigured implements HeapSize {
 
       // Tell observers that list of StoreFiles has changed.
       notifyChangedReadersObservers();
-      // Finally, delete old store files.
-      for (StoreFile hsf: compactedFiles) {
-        hsf.deleteReader();
-      }
+
+      // let the archive util decide if we should archive or delete the files
+      LOG.debug("Removing store files after compaction...");
+      HFileArchiver.archiveStoreFiles(this.conf, this.fs, this.region, this.family.getName(),
+        compactedFiles);
+
     } catch (IOException e) {
       e = RemoteExceptionHandler.checkIOException(e);
-      LOG.error("Failed replacing compacted files in " + this.storeNameStr +
+      LOG.error("Failed replacing compacted files in " + this +
         ". Compacted file is " + (result == null? "none": result.toString()) +
         ".  Files replaced " + compactedFiles.toString() +
         " some of which may have been already removed", e);
@@ -1789,6 +1769,7 @@ public class Store extends SchemaConfigured implements HeapSize {
     }
     // TODO: Cache these keys rather than make each time?
     byte [] fk = r.getFirstKey();
+    if (fk == null) return;
     KeyValue firstKV = KeyValue.createKeyValueFromKey(fk, 0, fk.length);
     byte [] lk = r.getLastKey();
     KeyValue lastKV = KeyValue.createKeyValueFromKey(lk, 0, lk.length);
@@ -1802,7 +1783,7 @@ public class Store extends SchemaConfigured implements HeapSize {
       firstOnRow = new KeyValue(lastKV.getRow(), HConstants.LATEST_TIMESTAMP);
     }
     // Get a scanner that caches blocks and that uses pread.
-    HFileScanner scanner = r.getHFileReader().getScanner(true, true, false);
+    HFileScanner scanner = r.getScanner(true, true, false);
     // Seek scanner.  If can't seek it, return.
     if (!seekToScanner(scanner, firstOnRow, firstKV)) return;
     // If we found candidate on firstOnRow, just return. THIS WILL NEVER HAPPEN!
@@ -1947,9 +1928,9 @@ public class Store extends SchemaConfigured implements HeapSize {
         KeyValue firstKey = KeyValue.createKeyValueFromKey(fk, 0, fk.length);
         byte [] lk = r.getLastKey();
         KeyValue lastKey = KeyValue.createKeyValueFromKey(lk, 0, lk.length);
-        // if the midkey is the same as the first and last keys, then we cannot
+        // if the midkey is the same as the first or last keys, then we cannot
         // (ever) split this region.
-        if (this.comparator.compareRows(mk, firstKey) == 0 &&
+        if (this.comparator.compareRows(mk, firstKey) == 0 ||
             this.comparator.compareRows(mk, lastKey) == 0) {
           if (LOG.isDebugEnabled()) {
             LOG.debug("cannot split because midkey is the same as first or " +
@@ -1960,7 +1941,7 @@ public class Store extends SchemaConfigured implements HeapSize {
         return mk.getRow();
       }
     } catch(IOException e) {
-      LOG.warn("Failed getting store size for " + this.storeNameStr, e);
+      LOG.warn("Failed getting store size for " + this, e);
     } finally {
       this.lock.readLock().unlock();
     }
@@ -1994,11 +1975,18 @@ public class Store extends SchemaConfigured implements HeapSize {
    * are not in a compaction.
    * @throws IOException
    */
-  public StoreScanner getScanner(Scan scan,
+  public KeyValueScanner getScanner(Scan scan,
       final NavigableSet<byte []> targetCols) throws IOException {
     lock.readLock().lock();
     try {
-      return new StoreScanner(this, scan, targetCols);
+      KeyValueScanner scanner = null;
+      if (getHRegion().getCoprocessorHost() != null) {
+        scanner = getHRegion().getCoprocessorHost().preStoreScannerOpen(this, scan, targetCols);
+      }
+      if (scanner == null) {
+        scanner = new StoreScanner(this, getScanInfo(), scan, targetCols);
+      }
+      return scanner;
     } finally {
       lock.readLock().unlock();
     }
@@ -2006,7 +1994,7 @@ public class Store extends SchemaConfigured implements HeapSize {
 
   @Override
   public String toString() {
-    return this.storeNameStr;
+    return getColumnFamilyName();
   }
 
   /**
@@ -2093,19 +2081,36 @@ public class Store extends SchemaConfigured implements HeapSize {
     return this.memstore.heapSize();
   }
 
-  /**
-   * @return The priority that this store should have in the compaction queue
-   */
   public int getCompactPriority() {
-    return this.blockingStoreFileCount - this.storefiles.size();
+    return getCompactPriority(NO_PRIORITY);
   }
 
-  HRegion getHRegion() {
+  /**
+   * @return The priority that this store should have in the compaction queue
+   * @param priority
+   */
+  public int getCompactPriority(int priority) {
+    // If this is a user-requested compaction, leave this at the highest priority
+    if(priority == PRIORITY_USER) {
+      return PRIORITY_USER;
+    } else {
+      return this.blockingStoreFileCount - this.storefiles.size();
+    }
+  }
+
+  boolean throttleCompaction(long compactionSize) {
+    long throttlePoint = conf.getLong(
+        "hbase.regionserver.thread.compaction.throttle",
+        2 * this.minFilesToCompact * this.region.memstoreFlushSize);
+    return compactionSize > throttlePoint;
+  }
+
+  public HRegion getHRegion() {
     return this.region;
   }
 
   HRegionInfo getHRegionInfo() {
-    return this.region.regionInfo;
+    return this.region.getRegionInfo();
   }
 
   /**
@@ -2203,6 +2208,12 @@ public class Store extends SchemaConfigured implements HeapSize {
       }
       storeFile = Store.this.commitFile(storeFilePath, cacheFlushId,
                                snapshotTimeRangeTracker, flushedSize, status);
+      if (Store.this.getHRegion().getCoprocessorHost() != null) {
+        Store.this.getHRegion()
+            .getCoprocessorHost()
+            .postFlush(Store.this, storeFile);
+      }
+
       // Add new file to store files.  Clear snapshot too while we have
       // the Store write lock.
       return Store.this.updateStorefiles(storeFile, snapshot);
@@ -2225,10 +2236,10 @@ public class Store extends SchemaConfigured implements HeapSize {
     return this.cacheConf;
   }
 
-  public static final long FIXED_OVERHEAD = 
+  public static final long FIXED_OVERHEAD =
       ClassSize.align(SchemaConfigured.SCHEMA_CONFIGURED_UNALIGNED_HEAP_SIZE +
-          + (20 * ClassSize.REFERENCE) + (6 * Bytes.SIZEOF_LONG)
-          + (6 * Bytes.SIZEOF_INT) + Bytes.SIZEOF_BOOLEAN);
+          + (17 * ClassSize.REFERENCE) + (6 * Bytes.SIZEOF_LONG)
+          + (5 * Bytes.SIZEOF_INT) + Bytes.SIZEOF_BOOLEAN);
 
   public static final long DEEP_OVERHEAD = ClassSize.align(FIXED_OVERHEAD
       + ClassSize.OBJECT + ClassSize.REENTRANT_LOCK
@@ -2243,6 +2254,10 @@ public class Store extends SchemaConfigured implements HeapSize {
 
   public KeyValue.KVComparator getComparator() {
     return comparator;
+  }
+
+  public ScanInfo getScanInfo() {
+    return scanInfo;
   }
 
   /**
@@ -2261,6 +2276,17 @@ public class Store extends SchemaConfigured implements HeapSize {
         + (2 * ClassSize.REFERENCE) + (2 * Bytes.SIZEOF_INT)
         + Bytes.SIZEOF_LONG + Bytes.SIZEOF_BOOLEAN);
 
+    /**
+     * @param family {@link HColumnDescriptor} describing the column family
+     * @param ttl Store's TTL (in ms)
+     * @param timeToPurgeDeletes duration in ms after which a delete marker can
+     *        be purged during a major compaction.
+     * @param comparator The store's comparator
+     */
+    public ScanInfo(HColumnDescriptor family, long ttl, long timeToPurgeDeletes, KVComparator comparator) {
+      this(family.getName(), family.getMinVersions(), family.getMaxVersions(), ttl, family
+          .getKeepDeletedCells(), timeToPurgeDeletes, comparator);
+    }
     /**
      * @param family Name of this store's column family
      * @param minVersions Store's MIN_VERSIONS setting
@@ -2303,7 +2329,7 @@ public class Store extends SchemaConfigured implements HeapSize {
     public boolean getKeepDeletedCells() {
       return keepDeletedCells;
     }
-    
+
     public long getTimeToPurgeDeletes() {
       return timeToPurgeDeletes;
     }

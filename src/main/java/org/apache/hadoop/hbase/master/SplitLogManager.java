@@ -133,12 +133,10 @@ public class SplitLogManager extends ZooKeeperListener {
     this(zkw, conf, stopper, serverName, new TaskFinisher() {
       @Override
       public Status finish(String workerName, String logfile) {
-        String tmpname =
-          ZKSplitLog.getSplitLogDirTmpComponent(workerName, logfile);
         try {
-          HLogSplitter.moveRecoveredEditsFromTemp(tmpname, logfile, conf);
+          HLogSplitter.finishSplitLogFile(logfile, conf);
         } catch (IOException e) {
-          LOG.warn("Could not finish splitting of log file " + logfile);
+          LOG.warn("Could not finish splitting of log file " + logfile, e);
           return Status.ERR;
         }
         return Status.DONE;
@@ -182,9 +180,11 @@ public class SplitLogManager extends ZooKeeperListener {
         stopper);
   }
 
-  public void finishInitialization() {
-    Threads.setDaemonThreadRunning(timeoutMonitor.getThread(), serverName +
-      ".splitLogManagerTimeoutMonitor");
+  public void finishInitialization(boolean masterRecovery) {
+    if (!masterRecovery) {
+      Threads.setDaemonThreadRunning(timeoutMonitor.getThread(), serverName
+          + ".splitLogManagerTimeoutMonitor");
+    }
     // Watcher can be null during tests with Mock'd servers.
     if (this.watcher != null) {
       this.watcher.registerListener(this);
@@ -266,8 +266,10 @@ public class SplitLogManager extends ZooKeeperListener {
       tot_mgr_log_split_batch_err.incrementAndGet();
       LOG.warn("error while splitting logs in " + logDirs +
       " installed = " + batch.installed + " but only " + batch.done + " done");
-      throw new IOException("error or interrupt while splitting logs in "
-          + logDirs + " Task = " + batch);
+      String msg = "error or interrupted while splitting logs in "
+        + logDirs + " Task = " + batch;
+      status.abort(msg);
+      throw new IOException(msg);
     }
     for(Path logDir: logDirs){
       status.setStatus("Cleaning up log directory...");
@@ -321,6 +323,25 @@ public class SplitLogManager extends ZooKeeperListener {
               + " scheduled=" + batch.installed
               + " done=" + batch.done
               + " error=" + batch.error);
+          int remaining = batch.installed - (batch.done + batch.error);
+          int actual = activeTasks(batch);
+          if (remaining != actual) {
+            LOG.warn("Expected " + remaining
+              + " active tasks, but actually there are " + actual);
+          }
+          int remainingInZK = remainingTasksInZK();
+          if (remainingInZK >= 0 && actual > remainingInZK) {
+            LOG.warn("Expected at least" + actual
+              + " tasks in ZK, but actually there are " + remainingInZK);
+          }
+          if (remainingInZK == 0 || actual == 0) {
+            LOG.warn("No more task remaining (ZK or task map), splitting "
+              + "should have completed. Remaining tasks in ZK " + remainingInZK
+              + ", active tasks in map " + actual);
+            if (remainingInZK == 0 && actual == 0) {
+              return;
+            }
+          }
           batch.wait(100);
           if (stopper.isStopped()) {
             LOG.warn("Stopped while waiting for log splits to be completed");
@@ -333,6 +354,35 @@ public class SplitLogManager extends ZooKeeperListener {
         }
       }
     }
+  }
+
+  private int activeTasks(final TaskBatch batch) {
+    int count = 0;
+    for (Task t: tasks.values()) {
+      if (t.batch == batch && t.status == TerminationStatus.IN_PROGRESS) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  private int remainingTasksInZK() {
+    int count = 0;
+    try {
+      List<String> tasks =
+        ZKUtil.listChildrenNoWatch(watcher, watcher.splitLogZNode);
+      if (tasks != null) {
+        for (String t: tasks) {
+          if (!ZKSplitLog.isRescanNode(watcher, t)) {
+            count++;
+          }
+        }
+      }
+    } catch (KeeperException ke) {
+      LOG.warn("Failed to check remaining tasks", ke);
+      count = -1;
+    }
+    return count;
   }
 
   private void setDone(String path, TerminationStatus status) {
@@ -1149,5 +1199,12 @@ public class SplitLogManager extends ZooKeeperListener {
     public String toString() {
       return statusMsg;
     }
+  }
+  
+  /**
+   * Completes the initialization
+   */
+  public void finishInitialization() {
+    finishInitialization(false);
   }
 }

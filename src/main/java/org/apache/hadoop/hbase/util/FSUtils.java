@@ -23,12 +23,15 @@ import java.io.DataInputStream;
 import java.io.EOFException;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -40,7 +43,9 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.PathFilter;
+import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HDFSBlocksDistribution;
 import org.apache.hadoop.hbase.HRegionInfo;
@@ -49,6 +54,8 @@ import org.apache.hadoop.hbase.master.HMaster;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.io.SequenceFile;
+import org.apache.hadoop.security.AccessControlException;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.StringUtils;
 
@@ -146,7 +153,7 @@ public abstract class FSUtils {
    */
   public static FSDataOutputStream create(FileSystem fs, Path path,
       FsPermission perm, boolean overwrite) throws IOException {
-    LOG.debug("Creating file:" + path + "with permission:" + perm);
+    LOG.debug("Creating file=" + path + " with permission=" + perm);
 
     return fs.create(path, perm, overwrite,
         fs.getConf().getInt("io.file.buffer.size", 4096),
@@ -223,6 +230,31 @@ public abstract class FSUtils {
   }
 
   /**
+   * We use reflection because {@link DistributedFileSystem#setSafeMode(
+   * FSConstants.SafeModeAction action, boolean isChecked)} is not in hadoop 1.1
+   * 
+   * @param dfs
+   * @return whether we're in safe mode
+   * @throws IOException
+   */
+  private static boolean isInSafeMode(DistributedFileSystem dfs) throws IOException {
+    boolean inSafeMode = false;
+    try {
+      Method m = DistributedFileSystem.class.getMethod("setSafeMode", new Class<?> []{
+          org.apache.hadoop.hdfs.protocol.FSConstants.SafeModeAction.class, boolean.class});
+      inSafeMode = (Boolean) m.invoke(dfs,
+        org.apache.hadoop.hdfs.protocol.FSConstants.SafeModeAction.SAFEMODE_GET, true);
+    } catch (Exception e) {
+      if (e instanceof IOException) throw (IOException) e;
+      
+      // Check whether dfs is on safemode.
+      inSafeMode = dfs.setSafeMode(
+        org.apache.hadoop.hdfs.protocol.FSConstants.SafeModeAction.SAFEMODE_GET);      
+    }
+    return inSafeMode;    
+  }
+  
+  /**
    * Check whether dfs is in safemode. 
    * @param conf
    * @throws IOException
@@ -233,8 +265,7 @@ public abstract class FSUtils {
     FileSystem fs = FileSystem.get(conf);
     if (fs instanceof DistributedFileSystem) {
       DistributedFileSystem dfs = (DistributedFileSystem)fs;
-      // Check whether dfs is on safemode.
-      isInSafeMode = dfs.setSafeMode(org.apache.hadoop.hdfs.protocol.FSConstants.SafeModeAction.SAFEMODE_GET);
+      isInSafeMode = isInSafeMode(dfs);
     }
     if (isInSafeMode) {
       throw new IOException("File system is in safemode, it can't be written now");
@@ -521,7 +552,7 @@ public abstract class FSUtils {
     if (!(fs instanceof DistributedFileSystem)) return;
     DistributedFileSystem dfs = (DistributedFileSystem)fs;
     // Make sure dfs is not in safe mode
-    while (dfs.setSafeMode(org.apache.hadoop.hdfs.protocol.FSConstants.SafeModeAction.SAFEMODE_GET)) {
+    while (isInSafeMode(dfs)) {
       LOG.info("Waiting for dfs to exit safe mode...");
       try {
         Thread.sleep(wait);
@@ -555,6 +586,10 @@ public abstract class FSUtils {
     Path p = new Path(c.get(HConstants.HBASE_DIR));
     FileSystem fs = p.getFileSystem(c);
     return p.makeQualified(fs);
+  }
+
+  public static void setRootDir(final Configuration c, final Path root) throws IOException {
+    c.set(HConstants.HBASE_DIR, root.toString());
   }
 
   /**
@@ -926,6 +961,133 @@ public abstract class FSUtils {
   }
 
   /**
+   * Filter for all dirs that don't start with '.'
+   */
+  public static class RegionDirFilter implements PathFilter {
+    // This pattern will accept 0.90+ style hex region dirs and older numeric region dir names.
+    final public static Pattern regionDirPattern = Pattern.compile("^[0-9a-f]*$");
+    final FileSystem fs;
+
+    public RegionDirFilter(FileSystem fs) {
+      this.fs = fs;
+    }
+
+    @Override
+    public boolean accept(Path rd) {
+      if (!regionDirPattern.matcher(rd.getName()).matches()) {
+        return false;
+      }
+
+      try {
+        return fs.getFileStatus(rd).isDir();
+      } catch (IOException ioe) {
+        // Maybe the file was moved or the fs was disconnected.
+        LOG.warn("Skipping file " + rd +" due to IOException", ioe);
+        return false;
+      }
+    }
+  }
+
+  /**
+   * Given a particular table dir, return all the regiondirs inside it, excluding files such as
+   * .tableinfo
+   * @param fs A file system for the Path
+   * @param tableDir Path to a specific table directory <hbase.rootdir>/<tabledir>
+   * @return List of paths to valid region directories in table dir.
+   * @throws IOException
+   */
+  public static List<Path> getRegionDirs(final FileSystem fs, final Path tableDir) throws IOException {
+    // assumes we are in a table dir.
+    FileStatus[] rds = fs.listStatus(tableDir, new RegionDirFilter(fs));
+    List<Path> regionDirs = new ArrayList<Path>(rds.length);
+    for (FileStatus rdfs: rds) {
+      Path rdPath = rdfs.getPath();
+      regionDirs.add(rdPath);
+    }
+    return regionDirs;
+  }
+
+  /**
+   * Filter for all dirs that are legal column family names.  This is generally used for colfam
+   * dirs <hbase.rootdir>/<tabledir>/<regiondir>/<colfamdir>.
+   */
+  public static class FamilyDirFilter implements PathFilter {
+    final FileSystem fs;
+
+    public FamilyDirFilter(FileSystem fs) {
+      this.fs = fs;
+    }
+
+    @Override
+    public boolean accept(Path rd) {
+      try {
+        // throws IAE if invalid
+        HColumnDescriptor.isLegalFamilyName(Bytes.toBytes(rd.getName()));
+      } catch (IllegalArgumentException iae) {
+        // path name is an invalid family name and thus is excluded.
+        return false;
+      }
+
+      try {
+        return fs.getFileStatus(rd).isDir();
+      } catch (IOException ioe) {
+        // Maybe the file was moved or the fs was disconnected.
+        LOG.warn("Skipping file " + rd +" due to IOException", ioe);
+        return false;
+      }
+    }
+  }
+
+  /**
+   * Given a particular region dir, return all the familydirs inside it
+   *
+   * @param fs A file system for the Path
+   * @param regionDir Path to a specific region directory
+   * @return List of paths to valid family directories in region dir.
+   * @throws IOException
+   */
+  public static List<Path> getFamilyDirs(final FileSystem fs, final Path regionDir) throws IOException {
+    // assumes we are in a region dir.
+    FileStatus[] fds = fs.listStatus(regionDir, new FamilyDirFilter(fs));
+    List<Path> familyDirs = new ArrayList<Path>(fds.length);
+    for (FileStatus fdfs: fds) {
+      Path fdPath = fdfs.getPath();
+      familyDirs.add(fdPath);
+    }
+    return familyDirs;
+  }
+
+  /**
+   * Filter for HFiles that excludes reference files.
+   */
+  public static class HFileFilter implements PathFilter {
+    // This pattern will accept 0.90+ style hex hfies files but reject reference files
+    final public static Pattern hfilePattern = Pattern.compile("^([0-9a-f]+)$");
+
+    final FileSystem fs;
+
+    public HFileFilter(FileSystem fs) {
+      this.fs = fs;
+    }
+
+    @Override
+    public boolean accept(Path rd) {
+      if (!hfilePattern.matcher(rd.getName()).matches()) {
+        return false;
+      }
+
+      try {
+        // only files
+        return !fs.getFileStatus(rd).isDir();
+      } catch (IOException ioe) {
+        // Maybe the file was moved or the fs was disconnected.
+        LOG.warn("Skipping file " + rd +" due to IOException", ioe);
+        return false;
+      }
+    }
+  }
+
+  /**
    * @param conf
    * @return Returns the filesystem of the hbase rootdir.
    * @throws IOException
@@ -960,11 +1122,11 @@ public abstract class FSUtils {
     // presumes any directory under hbase.rootdir is a table
     FileStatus [] tableDirs = fs.listStatus(hbaseRootDir, df);
     for (FileStatus tableDir : tableDirs) {
-      // Skip the .log directory.  All others should be tables.  Inside a table,
-      // there are compaction.dir directories to skip.  Otherwise, all else
+      // Skip the .log and other non-table directories.  All others should be tables.
+      // Inside a table, there are compaction.dir directories to skip.  Otherwise, all else
       // should be regions. 
       Path d = tableDir.getPath();
-      if (d.getName().equals(HConstants.HREGION_LOGDIR_NAME)) {
+      if (HConstants.HBASE_NON_TABLE_DIRS.contains(d.getName())) {
         continue;
       }
       FileStatus[] regionDirs = fs.listStatus(d, df);
@@ -1028,6 +1190,54 @@ public abstract class FSUtils {
   }
 
   /**
+   * Throw an exception if an action is not permitted by a user on a file.
+   * 
+   * @param ugi
+   *          the user
+   * @param file
+   *          the file
+   * @param action
+   *          the action
+   */
+  public static void checkAccess(UserGroupInformation ugi, FileStatus file,
+      FsAction action) throws AccessControlException {
+    // See HBASE-7814. UserGroupInformation from hadoop 0.20.x may not support getShortUserName().
+    String username;
+    try {
+      Method m = UserGroupInformation.class.getMethod("getShortUserName", new Class<?>[]{});
+      username = (String) m.invoke(ugi);
+    } catch (NoSuchMethodException e) {
+      username = ugi.getUserName();
+    } catch (InvocationTargetException e) {
+      username = ugi.getUserName();      
+    } catch (IllegalAccessException iae) {
+      username = ugi.getUserName();      
+    }
+    if (username.equals(file.getOwner())) {
+      if (file.getPermission().getUserAction().implies(action)) {
+        return;
+      }
+    } else if (contains(ugi.getGroupNames(), file.getGroup())) {
+      if (file.getPermission().getGroupAction().implies(action)) {
+        return;
+      }
+    } else if (file.getPermission().getOtherAction().implies(action)) {
+      return;
+    }
+    throw new AccessControlException("Permission denied:" + " action=" + action
+        + " path=" + file.getPath() + " user=" + username);
+  }
+
+  private static boolean contains(String[] groups, String user) {
+    for (String group : groups) {
+      if (group.equals(user)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Calls fs.exists(). Checks if the specified path exists
    * 
    * @param fs
@@ -1037,5 +1247,37 @@ public abstract class FSUtils {
    */
   public static boolean isExists(final FileSystem fs, final Path path) throws IOException {
     return fs.exists(path);
+  }
+
+  /**
+   * Log the current state of the filesystem from a certain root directory
+   * @param fs filesystem to investigate
+   * @param root root file/directory to start logging from
+   * @param LOG log to output information
+   * @throws IOException if an unexpected exception occurs
+   */
+  public static void logFileSystemState(final FileSystem fs, final Path root, Log LOG)
+      throws IOException {
+    LOG.debug("Current file system:");
+    logFSTree(LOG, fs, root, "|-");
+  }
+
+  /**
+   * Recursive helper to log the state of the FS
+   * @see #logFileSystemState(FileSystem, Path, Log)
+   */
+  private static void logFSTree(Log LOG, final FileSystem fs, final Path root, String prefix)
+      throws IOException {
+    FileStatus[] files = FSUtils.listStatus(fs, root, null);
+    if (files == null) return;
+
+    for (FileStatus file : files) {
+      if (file.isDir()) {
+        LOG.debug(prefix + file.getPath().getName() + "/");
+        logFSTree(LOG, fs, file.getPath(), prefix + "---");
+      } else {
+        LOG.debug(prefix + file.getPath().getName());
+      }
+    }
   }
 }

@@ -24,6 +24,7 @@ import static org.apache.hadoop.hbase.util.hbck.HbckTestingUtil.assertNoErrors;
 import static org.apache.hadoop.hbase.util.hbck.HbckTestingUtil.doFsck;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -34,10 +35,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.ClusterStatus;
@@ -45,11 +49,13 @@ import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
+import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.LargeTests;
 import org.apache.hadoop.hbase.MiniHBaseCluster;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.client.Delete;
+import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.client.HConnection;
 import org.apache.hadoop.hbase.client.HTable;
@@ -59,10 +65,18 @@ import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.executor.EventHandler.EventType;
 import org.apache.hadoop.hbase.executor.RegionTransitionData;
+import org.apache.hadoop.hbase.io.hfile.TestHFile;
 import org.apache.hadoop.hbase.ipc.HRegionInterface;
+import org.apache.hadoop.hbase.master.HMaster;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
+import org.apache.hadoop.hbase.util.HBaseFsck.ErrorReporter;
+import org.apache.hadoop.hbase.util.HBaseFsck.PrintingErrorReporter;
+import org.apache.hadoop.hbase.util.HBaseFsck.TableInfo;
 import org.apache.hadoop.hbase.util.HBaseFsck.ErrorReporter.ERROR_CODE;
+import org.apache.hadoop.hbase.util.HBaseFsck.HbckInfo;
+import org.apache.hadoop.hbase.util.hbck.HFileCorruptionChecker;
+import org.apache.hadoop.hbase.util.hbck.HbckTestingUtil;
 import org.apache.hadoop.hbase.zookeeper.ZKAssign;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.zookeeper.KeeperException;
@@ -70,17 +84,21 @@ import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
+import org.junit.rules.TestName;
+
+import com.google.common.collect.Multimap;
 
 /**
  * This tests HBaseFsck's ability to detect reasons for inconsistent tables.
  */
-@Category(MediumTests.class)
+@Category(LargeTests.class)
 public class TestHBaseFsck {
   final static Log LOG = LogFactory.getLog(TestHBaseFsck.class);
   private final static HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
   private final static Configuration conf = TEST_UTIL.getConfiguration();
-  private final static byte[] FAM = Bytes.toBytes("fam");
-  private final static int REGION_ONLINE_TIMEOUT = 300;
+  private final static String FAM_STR = "fam";
+  private final static byte[] FAM = Bytes.toBytes(FAM_STR);
+  private final static int REGION_ONLINE_TIMEOUT = 800;
 
   // for the instance, reset every test run
   private HTable tbl;
@@ -238,7 +256,7 @@ public class TestHBaseFsck {
 
         if (unassign) {
           LOG.info("Undeploying region " + hri + " from server " + hsa);
-          undeployRegion(new HBaseAdmin(conf), hsa, hri);
+          undeployRegion(new HBaseAdmin(conf), hsa, new HRegionInfo(hri));
         }
 
         if (regionInfoOnly) {
@@ -297,6 +315,18 @@ public class TestHBaseFsck {
     }
     tbl.put(puts);
     tbl.flushCommits();
+    long endTime = System.currentTimeMillis() + 60000;
+    while (!TEST_UTIL.getHBaseAdmin().isTableEnabled(tablename)) {
+      try {
+        if (System.currentTimeMillis() > endTime) {
+          fail("Failed to enable table " + tablename + " after waiting for 60 sec");
+        }
+        Thread.sleep(100);
+      } catch (InterruptedException e) {
+        e.printStackTrace();
+        fail("Interrupted when waiting table " + tablename + " to be enabled");
+      }
+    }
     return tbl;
   }
 
@@ -355,6 +385,75 @@ public class TestHBaseFsck {
       assertEquals(0, hbck.getOverlapGroups(table).size());
       assertEquals(ROWKEYS.length, countRows());
     } finally {
+      deleteTable(table);
+    }
+  }
+
+  /**
+   * Test thread pooling in the case where there are more regions than threads
+   */
+  @Test
+  public void testHbckThreadpooling() throws Exception {
+    String table = "tableDupeStartKey";
+    try {
+      // Create table with 4 regions
+      setupTable(table);
+
+      // limit number of threads to 1.
+      Configuration newconf = new Configuration(conf);
+      newconf.setInt("hbasefsck.numthreads", 1);  
+      assertNoErrors(doFsck(newconf, false));
+      
+      // We should pass without triggering a RejectedExecutionException
+    } finally {
+      deleteTable(table);
+    }    
+  }
+  
+  @Test
+  public void testHbckFixOrphanTable() throws Exception {
+    String table = "tableInfo";
+    FileSystem fs = null;
+    Path tableinfo = null;
+    try {
+      setupTable(table);
+      HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
+      
+      Path hbaseTableDir = new Path(conf.get(HConstants.HBASE_DIR) + "/" + table );
+      fs = hbaseTableDir.getFileSystem(conf);
+      FileStatus status = FSTableDescriptors.getTableInfoPath(fs, hbaseTableDir);
+      tableinfo = status.getPath();
+      fs.rename(tableinfo, new Path("/.tableinfo"));
+      
+      //to report error if .tableinfo is missing.
+      HBaseFsck hbck = doFsck(conf, false); 
+      assertErrors(hbck, new ERROR_CODE[] { ERROR_CODE.NO_TABLEINFO_FILE });
+      
+      // fix OrphanTable with default .tableinfo (htd not yet cached on master)
+      hbck = doFsck(conf, true);
+      assertNoErrors(hbck);
+      status = null;
+      status = FSTableDescriptors.getTableInfoPath(fs, hbaseTableDir);
+      assertNotNull(status);
+      
+      HTableDescriptor htd = admin.getTableDescriptor(table.getBytes());
+      htd.setValue("NOT_DEFAULT", "true");
+      admin.disableTable(table);
+      admin.modifyTable(table.getBytes(), htd);
+      admin.enableTable(table);
+      fs.delete(status.getPath(), true);
+      
+      // fix OrphanTable with cache
+      htd = admin.getTableDescriptor(table.getBytes()); // warms up cached htd on master
+      hbck = doFsck(conf, true);
+      assertNoErrors(hbck);
+      status = null;
+      status = FSTableDescriptors.getTableInfoPath(fs, hbaseTableDir);
+      assertNotNull(status);
+      htd = admin.getTableDescriptor(table.getBytes());
+      assertEquals(htd.getValue("NOT_DEFAULT"), "true");
+    } finally {
+      fs.rename(new Path("/.tableinfo"), tableinfo);
       deleteTable(table);
     }
   }
@@ -459,8 +558,7 @@ public class TestHBaseFsck {
       // differentiate on ts/regionId!  We actually need to recheck
       // deployments!
       HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
-      ServerName hsi;
-      while ( (hsi = findDeployedHSI(getDeployedHRIs(admin), hriDupe)) == null) {
+      while (findDeployedHSI(getDeployedHRIs(admin), hriDupe) == null) {
         Thread.sleep(250);
       }
 
@@ -523,7 +621,6 @@ public class TestHBaseFsck {
     }
   }
 
-
   /**
    * This creates and fixes a bad table where a region is completely contained
    * by another region.
@@ -556,6 +653,98 @@ public class TestHBaseFsck {
       assertNoErrors(hbck2);
       assertEquals(0, hbck2.getOverlapGroups(table).size());
       assertEquals(ROWKEYS.length, countRows());
+    } finally {
+       deleteTable(table);
+    }
+  }
+
+  /**
+   * This creates and fixes a bad table where an overlap group of
+   * 3 regions. Set HBaseFsck.maxMerge to 2 to trigger sideline overlapped
+   * region. Mess around the meta data so that closeRegion/offlineRegion
+   * throws exceptions.
+   */
+  @Test
+  public void testSidelineOverlapRegion() throws Exception {
+    String table = "testSidelineOverlapRegion";
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+
+      // Mess it up by creating an overlap
+      MiniHBaseCluster cluster = TEST_UTIL.getHBaseCluster();
+      HMaster master = cluster.getMaster();
+      HRegionInfo hriOverlap1 = createRegion(conf, tbl.getTableDescriptor(),
+        Bytes.toBytes("A"), Bytes.toBytes("AB"));
+      master.assignRegion(hriOverlap1);
+      master.getAssignmentManager().waitForAssignment(hriOverlap1);
+      HRegionInfo hriOverlap2 = createRegion(conf, tbl.getTableDescriptor(),
+        Bytes.toBytes("AB"), Bytes.toBytes("B"));
+      master.assignRegion(hriOverlap2);
+      master.getAssignmentManager().waitForAssignment(hriOverlap2);
+
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] {ERROR_CODE.DUPE_STARTKEYS,
+        ERROR_CODE.DUPE_STARTKEYS, ERROR_CODE.OVERLAP_IN_REGION_CHAIN});
+      assertEquals(3, hbck.getOverlapGroups(table).size());
+      assertEquals(ROWKEYS.length, countRows());
+
+      // mess around the overlapped regions, to trigger NotServingRegionException
+      Multimap<byte[], HbckInfo> overlapGroups = hbck.getOverlapGroups(table);
+      ServerName serverName = null;
+      byte[] regionName = null;
+      for (HbckInfo hbi: overlapGroups.values()) {
+        if ("A".equals(Bytes.toString(hbi.getStartKey()))
+            && "B".equals(Bytes.toString(hbi.getEndKey()))) {
+          regionName = hbi.getRegionName();
+
+          // get an RS not serving the region to force bad assignment info in to META.
+          int k = cluster.getServerWith(regionName);
+          for (int i = 0; i < 3; i++) {
+            if (i != k) {
+              HRegionServer rs = cluster.getRegionServer(i);
+              serverName = rs.getServerName();
+              break;
+            }
+          }
+
+          HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
+          HBaseFsckRepair.closeRegionSilentlyAndWait(admin,
+            cluster.getRegionServer(k).getServerName(), hbi.getHdfsHRI());
+          admin.unassign(regionName, true);
+          break;
+        }
+      }
+
+      assertNotNull(regionName);
+      assertNotNull(serverName);
+      HTable meta = new HTable(conf, HConstants.META_TABLE_NAME);
+      Put put = new Put(regionName);
+      put.add(HConstants.CATALOG_FAMILY, HConstants.SERVER_QUALIFIER,
+        Bytes.toBytes(serverName.getHostAndPort()));
+      meta.put(put);
+
+      // fix the problem.
+      HBaseFsck fsck = new HBaseFsck(conf);
+      fsck.connect();
+      fsck.setDisplayFullReport(); // i.e. -details
+      fsck.setTimeLag(0);
+      fsck.setFixAssignments(true);
+      fsck.setFixMeta(true);
+      fsck.setFixHdfsHoles(true);
+      fsck.setFixHdfsOverlaps(true);
+      fsck.setFixHdfsOrphans(true);
+      fsck.setFixVersionFile(true);
+      fsck.setSidelineBigOverlaps(true);
+      fsck.setMaxMerge(2);
+      fsck.onlineHbck();
+
+      // verify that overlaps are fixed, and there are less rows
+      // since one region is sidelined.
+      HBaseFsck hbck2 = doFsck(conf,false);
+      assertNoErrors(hbck2);
+      assertEquals(0, hbck2.getOverlapGroups(table).size());
+      assertTrue(ROWKEYS.length > countRows());
     } finally {
        deleteTable(table);
     }
@@ -946,7 +1135,646 @@ public class TestHBaseFsck {
     }
   }
 
+  /**
+   * This creates two tables and mess both of them and fix them one by one
+   */
+  @Test
+  public void testFixByTable() throws Exception {
+    String table1 = "testFixByTable1";
+    String table2 = "testFixByTable2";
+    try {
+      setupTable(table1);
+      // make sure data in regions, if in hlog only there is no data loss
+      TEST_UTIL.getHBaseAdmin().flush(table1);
+      // Mess them up by leaving a hole in the hdfs data
+      deleteRegion(conf, tbl.getTableDescriptor(), Bytes.toBytes("B"),
+        Bytes.toBytes("C"), false, false, true); // don't rm meta
+
+      setupTable(table2);
+      // make sure data in regions, if in hlog only there is no data loss
+      TEST_UTIL.getHBaseAdmin().flush(table2);
+      // Mess them up by leaving a hole in the hdfs data
+      deleteRegion(conf, tbl.getTableDescriptor(), Bytes.toBytes("B"),
+        Bytes.toBytes("C"), false, false, true); // don't rm meta
+
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] {
+        ERROR_CODE.NOT_IN_HDFS, ERROR_CODE.NOT_IN_HDFS});
+
+      // fix hole in table 1
+      doFsck(conf, true, table1);
+      // check that hole in table 1 fixed
+      assertNoErrors(doFsck(conf, false, table1));
+      // check that hole in table 2 still there
+      assertErrors(doFsck(conf, false, table2),
+        new ERROR_CODE[] {ERROR_CODE.NOT_IN_HDFS});
+
+      // fix hole in table 2
+      doFsck(conf, true, table2);
+      // check that hole in both tables fixed
+      assertNoErrors(doFsck(conf, false));
+      assertEquals(ROWKEYS.length - 2, countRows());
+    } finally {
+      deleteTable(table1);
+      deleteTable(table2);
+    }
+  }
+  /**
+   * A split parent in meta, in hdfs, and not deployed
+   */
+  @Test
+  public void testLingeringSplitParent() throws Exception {
+    String table = "testLingeringSplitParent";
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+
+      // make sure data in regions, if in hlog only there is no data loss
+      TEST_UTIL.getHBaseAdmin().flush(table);
+      HRegionLocation location = tbl.getRegionLocation("B");
+
+      // Delete one region from meta, but not hdfs, unassign it.
+      deleteRegion(conf, tbl.getTableDescriptor(), Bytes.toBytes("B"),
+        Bytes.toBytes("C"), true, true, false);
+
+      // Create a new meta entry to fake it as a split parent.
+      HTable meta = new HTable(conf, HTableDescriptor.META_TABLEDESC.getName());
+      HRegionInfo hri = location.getRegionInfo();
+
+      HRegionInfo a = new HRegionInfo(tbl.getTableName(),
+        Bytes.toBytes("B"), Bytes.toBytes("BM"));
+      HRegionInfo b = new HRegionInfo(tbl.getTableName(),
+        Bytes.toBytes("BM"), Bytes.toBytes("C"));
+      Put p = new Put(hri.getRegionName());
+      hri.setOffline(true);
+      hri.setSplit(true);
+      p.add(HConstants.CATALOG_FAMILY, HConstants.REGIONINFO_QUALIFIER,
+        Writables.getBytes(hri));
+      p.add(HConstants.CATALOG_FAMILY, HConstants.SPLITA_QUALIFIER,
+        Writables.getBytes(a));
+      p.add(HConstants.CATALOG_FAMILY, HConstants.SPLITB_QUALIFIER,
+        Writables.getBytes(b));
+      meta.put(p);
+      meta.flushCommits();
+      TEST_UTIL.getHBaseAdmin().flush(HConstants.META_TABLE_NAME);
+
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] {
+        ERROR_CODE.LINGERING_SPLIT_PARENT, ERROR_CODE.HOLE_IN_REGION_CHAIN});
+
+      // regular repair cannot fix lingering split parent
+      hbck = doFsck(conf, true);
+      assertErrors(hbck, new ERROR_CODE[] {
+        ERROR_CODE.LINGERING_SPLIT_PARENT, ERROR_CODE.HOLE_IN_REGION_CHAIN});
+      assertFalse(hbck.shouldRerun());
+      hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] {
+        ERROR_CODE.LINGERING_SPLIT_PARENT, ERROR_CODE.HOLE_IN_REGION_CHAIN});
+
+      // fix lingering split parent
+      hbck = new HBaseFsck(conf);
+      hbck.connect();
+      hbck.setDisplayFullReport(); // i.e. -details
+      hbck.setTimeLag(0);
+      hbck.setFixSplitParents(true);
+      hbck.onlineHbck();
+      assertTrue(hbck.shouldRerun());
+
+      Get get = new Get(hri.getRegionName());
+      Result result = meta.get(get);
+      assertTrue(result.getColumn(HConstants.CATALOG_FAMILY,
+        HConstants.SPLITA_QUALIFIER).isEmpty());
+      assertTrue(result.getColumn(HConstants.CATALOG_FAMILY,
+        HConstants.SPLITB_QUALIFIER).isEmpty());
+      TEST_UTIL.getHBaseAdmin().flush(HConstants.META_TABLE_NAME);
+
+      // fix other issues
+      doFsck(conf, true);
+
+      // check that all are fixed
+      assertNoErrors(doFsck(conf, false));
+      assertEquals(ROWKEYS.length, countRows());
+    } finally {
+      deleteTable(table);
+    }
+  }
+
+  /**
+   * This creates and fixes a bad table with a missing region which is the 1st region -- hole in
+   * meta and data missing in the fs.
+   */
+  @Test
+  public void testMissingFirstRegion() throws Exception {
+    String table = "testMissingFirstRegion";
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+
+      // Mess it up by leaving a hole in the assignment, meta, and hdfs data
+      TEST_UTIL.getHBaseAdmin().disableTable(table);
+      deleteRegion(conf, tbl.getTableDescriptor(), Bytes.toBytes(""), Bytes.toBytes("A"), true,
+          true, true);
+      TEST_UTIL.getHBaseAdmin().enableTable(table);
+
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] { ERROR_CODE.FIRST_REGION_STARTKEY_NOT_EMPTY });
+      // fix hole
+      doFsck(conf, true);
+      // check that hole fixed
+      assertNoErrors(doFsck(conf, false));
+    } finally {
+      deleteTable(table);
+    }
+  }
+  
+  /**
+   * This creates and fixes a bad table with missing last region -- hole in meta and data missing in
+   * the fs.
+   */
+  @Test
+  public void testMissingLastRegion() throws Exception {
+    String table = "testMissingLastRegion";
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+
+      // Mess it up by leaving a hole in the assignment, meta, and hdfs data
+      TEST_UTIL.getHBaseAdmin().disableTable(table);
+      deleteRegion(conf, tbl.getTableDescriptor(), Bytes.toBytes("C"), Bytes.toBytes(""), true,
+          true, true);
+      TEST_UTIL.getHBaseAdmin().enableTable(table);
+
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] { ERROR_CODE.LAST_REGION_ENDKEY_NOT_EMPTY });
+      // fix hole
+      doFsck(conf, true);
+      // check that hole fixed
+      assertNoErrors(doFsck(conf, false));
+    } finally {
+      deleteTable(table);
+    }
+  }
+
+  /**
+   * Test -noHdfsChecking option can detect and fix assignments issue.
+   */
+  @Test
+  public void testFixAssignmentsAndNoHdfsChecking() throws Exception {
+    String table = "testFixAssignmentsAndNoHdfsChecking";
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+
+      // Mess it up by closing a region
+      deleteRegion(conf, tbl.getTableDescriptor(), Bytes.toBytes("A"),
+        Bytes.toBytes("B"), true, false, false, false);
+
+      // verify there is no other errors
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] {
+        ERROR_CODE.NOT_DEPLOYED, ERROR_CODE.HOLE_IN_REGION_CHAIN});
+
+      // verify that noHdfsChecking report the same errors
+      HBaseFsck fsck = new HBaseFsck(conf);
+      fsck.connect();
+      fsck.setDisplayFullReport(); // i.e. -details
+      fsck.setTimeLag(0);
+      fsck.setCheckHdfs(false);
+      fsck.onlineHbck();
+      assertErrors(fsck, new ERROR_CODE[] {
+        ERROR_CODE.NOT_DEPLOYED, ERROR_CODE.HOLE_IN_REGION_CHAIN});
+
+      // verify that fixAssignments works fine with noHdfsChecking
+      fsck = new HBaseFsck(conf);
+      fsck.connect();
+      fsck.setDisplayFullReport(); // i.e. -details
+      fsck.setTimeLag(0);
+      fsck.setCheckHdfs(false);
+      fsck.setFixAssignments(true);
+      fsck.onlineHbck();
+      assertTrue(fsck.shouldRerun());
+      fsck.onlineHbck();
+      assertNoErrors(fsck);
+
+      assertEquals(ROWKEYS.length, countRows());
+    } finally {
+      deleteTable(table);
+    }
+  }
+
+  /**
+   * Test -noHdfsChecking option can detect region is not in meta but deployed.
+   * However, it can not fix it without checking Hdfs because we need to get
+   * the region info from Hdfs in this case, then to patch the meta.
+   */
+  @Test
+  public void testFixMetaNotWorkingWithNoHdfsChecking() throws Exception {
+    String table = "testFixMetaNotWorkingWithNoHdfsChecking";
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+
+      // Mess it up by deleting a region from the metadata
+      deleteRegion(conf, tbl.getTableDescriptor(), Bytes.toBytes("A"),
+        Bytes.toBytes("B"), false, true, false, false);
+
+      // verify there is no other errors
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] {
+        ERROR_CODE.NOT_IN_META, ERROR_CODE.HOLE_IN_REGION_CHAIN});
+
+      // verify that noHdfsChecking report the same errors
+      HBaseFsck fsck = new HBaseFsck(conf);
+      fsck.connect();
+      fsck.setDisplayFullReport(); // i.e. -details
+      fsck.setTimeLag(0);
+      fsck.setCheckHdfs(false);
+      fsck.onlineHbck();
+      assertErrors(fsck, new ERROR_CODE[] {
+        ERROR_CODE.NOT_IN_META, ERROR_CODE.HOLE_IN_REGION_CHAIN});
+
+      // verify that fixMeta doesn't work with noHdfsChecking
+      fsck = new HBaseFsck(conf);
+      fsck.connect();
+      fsck.setDisplayFullReport(); // i.e. -details
+      fsck.setTimeLag(0);
+      fsck.setCheckHdfs(false);
+      fsck.setFixAssignments(true);
+      fsck.setFixMeta(true);
+      fsck.onlineHbck();
+      assertFalse(fsck.shouldRerun());
+      assertErrors(fsck, new ERROR_CODE[] {
+        ERROR_CODE.NOT_IN_META, ERROR_CODE.HOLE_IN_REGION_CHAIN});
+    } finally {
+      deleteTable(table);
+    }
+  }
+
+  /**
+   * Test -fixHdfsHoles doesn't work with -noHdfsChecking option,
+   * and -noHdfsChecking can't detect orphan Hdfs region.
+   */
+  @Test
+  public void testFixHdfsHolesNotWorkingWithNoHdfsChecking() throws Exception {
+    String table = "testFixHdfsHolesNotWorkingWithNoHdfsChecking";
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+
+      // Mess it up by creating an overlap in the metadata
+      TEST_UTIL.getHBaseAdmin().disableTable(table);
+      deleteRegion(conf, tbl.getTableDescriptor(), Bytes.toBytes("A"),
+        Bytes.toBytes("B"), true, true, false, true);
+      TEST_UTIL.getHBaseAdmin().enableTable(table);
+
+      HRegionInfo hriOverlap = createRegion(conf, tbl.getTableDescriptor(),
+        Bytes.toBytes("A2"), Bytes.toBytes("B"));
+      TEST_UTIL.getHBaseCluster().getMaster().assignRegion(hriOverlap);
+      TEST_UTIL.getHBaseCluster().getMaster().getAssignmentManager()
+        .waitForAssignment(hriOverlap);
+
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] {
+        ERROR_CODE.ORPHAN_HDFS_REGION, ERROR_CODE.NOT_IN_META_OR_DEPLOYED,
+        ERROR_CODE.HOLE_IN_REGION_CHAIN});
+
+      // verify that noHdfsChecking can't detect ORPHAN_HDFS_REGION
+      HBaseFsck fsck = new HBaseFsck(conf);
+      fsck.connect();
+      fsck.setDisplayFullReport(); // i.e. -details
+      fsck.setTimeLag(0);
+      fsck.setCheckHdfs(false);
+      fsck.onlineHbck();
+      assertErrors(fsck, new ERROR_CODE[] {
+        ERROR_CODE.HOLE_IN_REGION_CHAIN});
+
+      // verify that fixHdfsHoles doesn't work with noHdfsChecking
+      fsck = new HBaseFsck(conf);
+      fsck.connect();
+      fsck.setDisplayFullReport(); // i.e. -details
+      fsck.setTimeLag(0);
+      fsck.setCheckHdfs(false);
+      fsck.setFixHdfsHoles(true);
+      fsck.setFixHdfsOverlaps(true);
+      fsck.setFixHdfsOrphans(true);
+      fsck.onlineHbck();
+      assertFalse(fsck.shouldRerun());
+      assertErrors(fsck, new ERROR_CODE[] {
+        ERROR_CODE.HOLE_IN_REGION_CHAIN});
+    } finally {
+      if (TEST_UTIL.getHBaseAdmin().isTableDisabled(table)) {
+        TEST_UTIL.getHBaseAdmin().enableTable(table);
+      }
+      deleteTable(table);
+    }
+  }
+
+  /**
+   * We don't have an easy way to verify that a flush completed, so we loop until we find a
+   * legitimate hfile and return it.
+   * @param fs
+   * @param table
+   * @return Path of a flushed hfile.
+   * @throws IOException
+   */
+  Path getFlushedHFile(FileSystem fs, String table) throws IOException {
+    Path tableDir= FSUtils.getTablePath(FSUtils.getRootDir(conf), table);
+    Path regionDir = FSUtils.getRegionDirs(fs, tableDir).get(0);
+    Path famDir = new Path(regionDir, FAM_STR);
+
+    // keep doing this until we get a legit hfile
+    while (true) {
+      FileStatus[] hfFss = fs.listStatus(famDir);
+      if (hfFss.length == 0) {
+        continue;
+      }
+      for (FileStatus hfs : hfFss) {
+        if (!hfs.isDir()) {
+          return hfs.getPath();
+        }
+      }
+    }
+  }
+
+  /**
+   * This creates a table and then corrupts an hfile.  Hbck should quarantine the file.
+   */
+  @Test(timeout=120000)
+  public void testQuarantineCorruptHFile() throws Exception {
+    String table = name.getMethodName();
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+      TEST_UTIL.getHBaseAdmin().flush(table); // flush is async.
+
+      FileSystem fs = FileSystem.get(conf);
+      Path hfile = getFlushedHFile(fs, table);
+
+      // Mess it up by leaving a hole in the assignment, meta, and hdfs data
+      TEST_UTIL.getHBaseAdmin().disableTable(table);
+
+      // create new corrupt file called deadbeef (valid hfile name)
+      Path corrupt = new Path(hfile.getParent(), "deadbeef");
+      TestHFile.truncateFile(fs, hfile, corrupt);
+      LOG.info("Created corrupted file " + corrupt);
+      HBaseFsck.debugLsr(conf, FSUtils.getRootDir(conf));
+
+      // we cannot enable here because enable never finished due to the corrupt region.
+      HBaseFsck res = HbckTestingUtil.doHFileQuarantine(conf, table);
+      assertEquals(res.getRetCode(), 0);
+      HFileCorruptionChecker hfcc = res.getHFilecorruptionChecker();
+      assertEquals(hfcc.getHFilesChecked(), 5);
+      assertEquals(hfcc.getCorrupted().size(), 1);
+      assertEquals(hfcc.getFailures().size(), 0);
+      assertEquals(hfcc.getQuarantined().size(), 1);
+      assertEquals(hfcc.getMissing().size(), 0);
+
+      // Its been fixed, verify that we can enable.
+      TEST_UTIL.getHBaseAdmin().enableTable(table);
+    } finally {
+      deleteTable(table);
+    }
+  }
+
+  /**
+  * Test that use this should have a timeout, because this method could potentially wait forever.
+  */
+  private void doQuarantineTest(String table, HBaseFsck hbck, int check, int corrupt, int fail,
+      int quar, int missing) throws Exception {
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+      TEST_UTIL.getHBaseAdmin().flush(table); // flush is async.
+
+      // Mess it up by leaving a hole in the assignment, meta, and hdfs data
+      TEST_UTIL.getHBaseAdmin().disableTable(table);
+      
+      String[] args = {"-sidelineCorruptHFiles", "-repairHoles", "-ignorePreCheckPermission", table};
+      ExecutorService exec = new ScheduledThreadPoolExecutor(10);
+      HBaseFsck res = hbck.exec(exec, args);
+
+      HFileCorruptionChecker hfcc = res.getHFilecorruptionChecker();
+      assertEquals(hfcc.getHFilesChecked(), check);
+      assertEquals(hfcc.getCorrupted().size(), corrupt);
+      assertEquals(hfcc.getFailures().size(), fail);
+      assertEquals(hfcc.getQuarantined().size(), quar);
+      assertEquals(hfcc.getMissing().size(), missing);
+
+      // its been fixed, verify that we can enable
+      HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
+      admin.enableTableAsync(table);
+      while (!admin.isTableEnabled(table)) {
+        try {
+          Thread.sleep(250);
+        } catch (InterruptedException e) {
+          e.printStackTrace();
+          fail("Interrupted when trying to enable table " + table);
+        }
+      }
+    } finally {
+      deleteTable(table);
+    }
+  }
+
+  /**
+   * This creates a table and simulates the race situation where a concurrent compaction or split
+   * has removed an hfile after the corruption checker learned about it.
+   */
+  @Test(timeout=120000)
+  public void testQuarantineMissingHFile() throws Exception {
+    String table = name.getMethodName();
+    ExecutorService exec = new ScheduledThreadPoolExecutor(10);
+    // inject a fault in the hfcc created.
+    final FileSystem fs = FileSystem.get(conf);
+    HBaseFsck hbck = new HBaseFsck(conf, exec) {
+      public HFileCorruptionChecker createHFileCorruptionChecker(boolean sidelineCorruptHFiles) throws IOException {
+        return new HFileCorruptionChecker(conf, executor, sidelineCorruptHFiles) {
+          boolean attemptedFirstHFile = false;
+          protected void checkHFile(Path p) throws IOException {
+            if (!attemptedFirstHFile) {
+              attemptedFirstHFile = true;
+              assertTrue(fs.delete(p, true)); // make sure delete happened.
+            }
+            super.checkHFile(p);
+          }
+        };
+      }
+    };
+    doQuarantineTest(table, hbck, 4, 0, 0, 0, 1); // 4 attempted, but 1 missing.
+  }
+
+  /**
+   * This creates a table and simulates the race situation where a concurrent compaction or split
+   * has removed an colfam dir before the corruption checker got to it.
+   */
+  @Test(timeout=120000)
+  public void testQuarantineMissingFamdir() throws Exception {
+    String table = name.getMethodName();
+    ExecutorService exec = new ScheduledThreadPoolExecutor(10);
+    // inject a fault in the hfcc created.
+    final FileSystem fs = FileSystem.get(conf);
+    HBaseFsck hbck = new HBaseFsck(conf, exec) {
+      public HFileCorruptionChecker createHFileCorruptionChecker(boolean sidelineCorruptHFiles) throws IOException {
+        return new HFileCorruptionChecker(conf, executor, sidelineCorruptHFiles) {
+          boolean attemptedFirstFamDir = false;
+          protected void checkColFamDir(Path p) throws IOException {
+            if (!attemptedFirstFamDir) {
+              attemptedFirstFamDir = true;
+              assertTrue(fs.delete(p, true)); // make sure delete happened.
+            }
+            super.checkColFamDir(p);
+          }
+        };
+      }
+    };
+    doQuarantineTest(table, hbck, 3, 0, 0, 0, 1);
+  }
+
+  /**
+   * This creates a table and simulates the race situation where a concurrent compaction or split
+   * has removed a region dir before the corruption checker got to it.
+   */
+  @Test(timeout=120000)
+  public void testQuarantineMissingRegionDir() throws Exception {
+    String table = name.getMethodName();
+    ExecutorService exec = new ScheduledThreadPoolExecutor(10);
+    // inject a fault in the hfcc created.
+    final FileSystem fs = FileSystem.get(conf);
+    HBaseFsck hbck = new HBaseFsck(conf, exec) {
+      public HFileCorruptionChecker createHFileCorruptionChecker(boolean sidelineCorruptHFiles) throws IOException {
+        return new HFileCorruptionChecker(conf, executor, sidelineCorruptHFiles) {
+          boolean attemptedFirstRegionDir = false;
+          protected void checkRegionDir(Path p) throws IOException {
+            if (!attemptedFirstRegionDir) {
+              attemptedFirstRegionDir = true;
+              assertTrue(fs.delete(p, true)); // make sure delete happened.
+            }
+            super.checkRegionDir(p);
+          }
+        };
+      }
+    };
+    doQuarantineTest(table, hbck, 3, 0, 0, 0, 1);
+  }
+
+  /**
+   * Test fixing lingering reference file.
+   */
+  @Test
+  public void testLingeringReferenceFile() throws Exception {
+    String table = "testLingeringReferenceFile";
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+
+      // Mess it up by creating a fake reference file
+      FileSystem fs = FileSystem.get(conf);
+      Path tableDir= FSUtils.getTablePath(FSUtils.getRootDir(conf), table);
+      Path regionDir = FSUtils.getRegionDirs(fs, tableDir).get(0);
+      Path famDir = new Path(regionDir, FAM_STR);
+      Path fakeReferenceFile = new Path(famDir, "fbce357483ceea.12144538");
+      fs.create(fakeReferenceFile);
+
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] { ERROR_CODE.LINGERING_REFERENCE_HFILE });
+      // fix reference file
+      doFsck(conf, true);
+      // check that reference file fixed
+      assertNoErrors(doFsck(conf, false));
+    } finally {
+      deleteTable(table);
+    }
+  }
+
+  /**
+   * Test pluggable error reporter. It can be plugged in
+   * from system property or configuration.
+   */
+  @Test
+  public void testErrorReporter() throws Exception {
+    try {
+      MockErrorReporter.calledCount = 0;
+      doFsck(conf, false);
+      assertEquals(MockErrorReporter.calledCount, 0);
+
+      conf.set("hbasefsck.errorreporter", MockErrorReporter.class.getName());
+      doFsck(conf, false);
+      assertTrue(MockErrorReporter.calledCount > 20);
+    } finally {
+      conf.set("hbasefsck.errorreporter",
+        PrintingErrorReporter.class.getName());
+      MockErrorReporter.calledCount = 0;
+    }
+  }
+
+  static class MockErrorReporter implements ErrorReporter {
+    static int calledCount = 0;
+
+    public void clear() {
+      calledCount++;
+    }
+
+    public void report(String message) {
+      calledCount++;
+    }
+
+    public void reportError(String message) {
+      calledCount++;
+    }
+
+    public void reportError(ERROR_CODE errorCode, String message) {
+      calledCount++;
+    }
+
+    public void reportError(ERROR_CODE errorCode, String message, TableInfo table) {
+      calledCount++;
+    }
+
+    public void reportError(ERROR_CODE errorCode,
+        String message, TableInfo table, HbckInfo info) {
+      calledCount++;
+    }
+
+    public void reportError(ERROR_CODE errorCode, String message,
+        TableInfo table, HbckInfo info1, HbckInfo info2) {
+      calledCount++;
+    }
+
+    public int summarize() {
+      return ++calledCount;
+    }
+
+    public void detail(String details) {
+      calledCount++;
+    }
+
+    public ArrayList<ERROR_CODE> getErrorList() {
+      calledCount++;
+      return new ArrayList<ERROR_CODE>();
+    }
+
+    public void progress() {
+      calledCount++;
+    }
+
+    public void print(String message) {
+      calledCount++;
+    }
+
+    public void resetErrors() {
+      calledCount++;
+    }
+
+    public boolean tableHasErrors(TableInfo table) {
+      calledCount++;
+      return false;
+    }
+  }
+
   @org.junit.Rule
   public org.apache.hadoop.hbase.ResourceCheckerJUnitRule cu =
     new org.apache.hadoop.hbase.ResourceCheckerJUnitRule();
+
+  @org.junit.Rule
+  public TestName name = new TestName();
 }

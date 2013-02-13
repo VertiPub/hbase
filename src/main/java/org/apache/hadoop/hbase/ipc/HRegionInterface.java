@@ -44,6 +44,7 @@ import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.filter.WritableByteArrayComparable;
 import org.apache.hadoop.hbase.io.hfile.BlockCacheColumnFamilySummary;
 import org.apache.hadoop.hbase.regionserver.RegionOpeningState;
+import org.apache.hadoop.hbase.regionserver.compactions.CompactionRequest.CompactionState;
 import org.apache.hadoop.hbase.regionserver.wal.FailedLogCloseException;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.security.TokenInfo;
@@ -532,6 +533,20 @@ public interface HRegionInterface extends VersionedProtocol, Stoppable, Abortabl
   throws NotServingRegionException, IOException;
 
   /**
+   * Compacts a column-family within a specified region.
+   * Performs a major compaction if specified.
+   * <p>
+   * This method is asynchronous.
+   * @param regionInfo region to compact
+   * @param major true to force major compaction
+   * @param columnFamily column family within a region to compact
+   * @throws NotServingRegionException
+   * @throws IOException
+   */
+  void compactRegion(HRegionInfo regionInfo, boolean major, byte[] columnFamily)
+  throws NotServingRegionException, IOException;
+   
+  /**
    * Replicates the given entries. The guarantee is that the given entries
    * will be durable on the slave cluster if this method returns without
    * any exception.
@@ -620,6 +635,15 @@ public interface HRegionInterface extends VersionedProtocol, Stoppable, Abortabl
    * region names as returned by {@link HRegionInfo#getEncodedName()} 
    */
   public byte[][] rollHLogWriter() throws IOException, FailedLogCloseException;
+
+  /**
+   * Get the current compaction state of the region.
+   *
+   * @param regionName the name of the region to check compaction statte.
+   * @return the compaction state name.
+   * @throws IOException exception
+   */
+  public String getCompactionState(final byte[] regionName) throws IOException;
 
   @Override
   public void stop(String why);

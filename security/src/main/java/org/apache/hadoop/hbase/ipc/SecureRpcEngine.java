@@ -20,10 +20,7 @@ package org.apache.hadoop.hbase.ipc;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.Server;
-import org.apache.hadoop.hbase.client.RetriesExhaustedException;
 import org.apache.hadoop.hbase.io.HbaseObjectWritable;
 import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandler;
 import org.apache.hadoop.hbase.security.HBasePolicyProvider;
@@ -32,20 +29,11 @@ import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.security.token.AuthenticationTokenSecretManager;
 import org.apache.hadoop.hbase.util.Objects;
 import org.apache.hadoop.io.Writable;
-import org.apache.hadoop.metrics.util.MetricsTimeVaryingRate;
-import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.security.authorize.ServiceAuthorizationManager;
 
-import javax.net.SocketFactory;
-import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.lang.reflect.*;
-import java.net.ConnectException;
 import java.net.InetSocketAddress;
-import java.net.SocketTimeoutException;
-import java.util.HashMap;
-import java.util.Map;
 
 /**
  * A loadable RPC engine supporting SASL authentication of connections, using
@@ -63,94 +51,46 @@ import java.util.Map;
  */
 public class SecureRpcEngine implements RpcEngine {
   // Leave this out in the hadoop ipc package but keep class name.  Do this
-  // so that we dont' get the logging of this class's invocations by doing our
+  // so that we do not get the logging of this class' invocations by doing our
   // blanket enabling DEBUG on the o.a.h.h. package.
   protected static final Log LOG =
     LogFactory.getLog("org.apache.hadoop.ipc.SecureRpcEngine");
 
-  private SecureRpcEngine() {
-    super();
-  }                                  // no public ctor
+  private Configuration conf;
+  private SecureClient client;
 
-  /* Cache a client using its socket factory as the hash key */
-  static private class ClientCache {
-    private Map<SocketFactory, SecureClient> clients =
-      new HashMap<SocketFactory, SecureClient>();
-
-    protected ClientCache() {}
-
-    /**
-     * Construct & cache an IPC client with the user-provided SocketFactory
-     * if no cached client exists.
-     *
-     * @param conf Configuration
-     * @param factory socket factory
-     * @return an IPC client
-     */
-    protected synchronized SecureClient getClient(Configuration conf,
-        SocketFactory factory) {
-      // Construct & cache client.  The configuration is only used for timeout,
-      // and Clients have connection pools.  So we can either (a) lose some
-      // connection pooling and leak sockets, or (b) use the same timeout for all
-      // configurations.  Since the IPC is usually intended globally, not
-      // per-job, we choose (a).
-      SecureClient client = clients.get(factory);
-      if (client == null) {
-        // Make an hbase client instead of hadoop Client.
-        client = new SecureClient(HbaseObjectWritable.class, conf, factory);
-        clients.put(factory, client);
-      } else {
-        client.incCount();
-      }
-      return client;
+  @Override
+  public void setConf(Configuration config) {
+    this.conf = config;
+    if (User.isHBaseSecurityEnabled(conf)) {
+      HBaseSaslRpcServer.init(conf);
     }
-
-    /**
-     * Construct & cache an IPC client with the default SocketFactory
-     * if no cached client exists.
-     *
-     * @param conf Configuration
-     * @return an IPC client
-     */
-    protected synchronized SecureClient getClient(Configuration conf) {
-      return getClient(conf, SocketFactory.getDefault());
+    // check for an already created client
+    if (this.client != null) {
+      this.client.stop();
     }
-
-    /**
-     * Stop a RPC client connection
-     * A RPC client is closed only when its reference count becomes zero.
-     * @param client client to stop
-     */
-    protected void stopClient(SecureClient client) {
-      synchronized (this) {
-        client.decCount();
-        if (client.isZeroReference()) {
-          clients.remove(client.getSocketFactory());
-        }
-      }
-      if (client.isZeroReference()) {
-        client.stop();
-      }
-    }
+    this.client = new SecureClient(HbaseObjectWritable.class, conf);
   }
 
-  protected final static ClientCache CLIENTS = new ClientCache();
+  @Override
+  public Configuration getConf() {
+    return this.conf;
+  }
 
   private static class Invoker implements InvocationHandler {
     private Class<? extends VersionedProtocol> protocol;
     private InetSocketAddress address;
     private User ticket;
     private SecureClient client;
-    private boolean isClosed = false;
     final private int rpcTimeout;
 
-    public Invoker(Class<? extends VersionedProtocol> protocol,
-        InetSocketAddress address, User ticket,
-        Configuration conf, SocketFactory factory, int rpcTimeout) {
+    public Invoker(SecureClient client,
+        Class<? extends VersionedProtocol> protocol,
+        InetSocketAddress address, User ticket, int rpcTimeout) {
       this.protocol = protocol;
       this.address = address;
       this.ticket = ticket;
-      this.client = CLIENTS.getClient(conf, factory);
+      this.client = client;
       this.rpcTimeout = rpcTimeout;
     }
 
@@ -162,21 +102,13 @@ public class SecureRpcEngine implements RpcEngine {
         startTime = System.currentTimeMillis();
       }
       HbaseObjectWritable value = (HbaseObjectWritable)
-        client.call(new Invocation(method, args), address,
+        client.call(new Invocation(method, protocol, args), address,
                     protocol, ticket, rpcTimeout);
       if (logDebug) {
         long callTime = System.currentTimeMillis() - startTime;
         LOG.debug("Call: " + method.getName() + " " + callTime);
       }
       return value.get();
-    }
-
-    /* close the IPC client that's responsible for this invoker's RPCs */
-    synchronized protected void close() {
-      if (!isClosed) {
-        isClosed = true;
-        CLIENTS.stopClient(client);
-      }
     }
   }
 
@@ -187,24 +119,30 @@ public class SecureRpcEngine implements RpcEngine {
    * @param protocol interface
    * @param clientVersion version we are expecting
    * @param addr remote address
-   * @param ticket ticket
    * @param conf configuration
-   * @param factory socket factory
    * @return proxy
    * @throws java.io.IOException e
    */
-  public VersionedProtocol getProxy(
-      Class<? extends VersionedProtocol> protocol, long clientVersion,
-      InetSocketAddress addr, User ticket,
-      Configuration conf, SocketFactory factory, int rpcTimeout)
+  @Override
+  public <T extends VersionedProtocol> T getProxy(
+      Class<T> protocol, long clientVersion,
+      InetSocketAddress addr,
+      Configuration conf, int rpcTimeout)
   throws IOException {
-    if (User.isSecurityEnabled()) {
-      HBaseSaslRpcServer.init(conf);
+    if (this.client == null) {
+      throw new IOException("Client must be initialized by calling setConf(Configuration)");
     }
-    VersionedProtocol proxy =
-        (VersionedProtocol) Proxy.newProxyInstance(
+
+    T proxy =
+        (T) Proxy.newProxyInstance(
             protocol.getClassLoader(), new Class[] { protocol },
-            new Invoker(protocol, addr, ticket, conf, factory, rpcTimeout));
+            new Invoker(this.client, protocol, addr, User.getCurrent(),
+                HBaseRPC.getRpcTimeout(rpcTimeout)));
+    /*
+     * TODO: checking protocol version only needs to be done once when we setup a new
+     * SecureClient.Connection.  Doing it every time we retrieve a proxy instance is resulting
+     * in unnecessary RPC traffic.
+     */
     long serverVersion = proxy.getProtocolVersion(protocol.getName(),
                                                   clientVersion);
     if (serverVersion != clientVersion) {
@@ -214,50 +152,48 @@ public class SecureRpcEngine implements RpcEngine {
     return proxy;
   }
 
-  /**
-   * Stop this proxy and release its invoker's resource
-   * @param proxy the proxy to be stopped
-   */
-  public void stopProxy(VersionedProtocol proxy) {
-    if (proxy!=null) {
-      ((Invoker)Proxy.getInvocationHandler(proxy)).close();
-    }
-  }
-
-
   /** Expert: Make multiple, parallel calls to a set of servers. */
+  @Override
   public Object[] call(Method method, Object[][] params,
                        InetSocketAddress[] addrs,
                        Class<? extends VersionedProtocol> protocol,
                        User ticket, Configuration conf)
     throws IOException, InterruptedException {
+    if (this.client == null) {
+      throw new IOException("Client must be initialized by calling setConf(Configuration)");
+    }
 
     Invocation[] invocations = new Invocation[params.length];
-    for (int i = 0; i < params.length; i++)
-      invocations[i] = new Invocation(method, params[i]);
-    SecureClient client = CLIENTS.getClient(conf);
-    try {
-      Writable[] wrappedValues =
-        client.call(invocations, addrs, protocol, ticket);
+    for (int i = 0; i < params.length; i++) {
+      invocations[i] = new Invocation(method, protocol, params[i]);
+    }
 
-      if (method.getReturnType() == Void.TYPE) {
-        return null;
-      }
+    Writable[] wrappedValues =
+      client.call(invocations, addrs, protocol, ticket);
 
-      Object[] values =
-          (Object[])Array.newInstance(method.getReturnType(), wrappedValues.length);
-      for (int i = 0; i < values.length; i++)
-        if (wrappedValues[i] != null)
-          values[i] = ((HbaseObjectWritable)wrappedValues[i]).get();
+    if (method.getReturnType() == Void.TYPE) {
+      return null;
+    }
 
-      return values;
-    } finally {
-      CLIENTS.stopClient(client);
+    Object[] values =
+        (Object[])Array.newInstance(method.getReturnType(), wrappedValues.length);
+    for (int i = 0; i < values.length; i++)
+      if (wrappedValues[i] != null)
+        values[i] = ((HbaseObjectWritable)wrappedValues[i]).get();
+
+    return values;
+  }
+
+  @Override
+  public void close() {
+    if (this.client != null) {
+      this.client.stop();
     }
   }
 
   /** Construct a server for a protocol implementation instance listening on a
    * port and address, with a secret manager. */
+  @Override
   public Server getServer(Class<? extends VersionedProtocol> protocol,
       final Object instance,
       Class<?>[] ifaces,

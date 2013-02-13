@@ -79,8 +79,11 @@ public class ReplicationPeer implements Abortable {
   public void startStateTracker(ZooKeeperWatcher zookeeper, String peerStateNode)
       throws KeeperException {
     if (ZKUtil.checkExists(zookeeper, peerStateNode) == -1) {
-      ZKUtil.createAndWatch(zookeeper, peerStateNode,
-          Bytes.toBytes(PeerState.ENABLED.name())); // enabled by default
+      // There is a race b/w PeerWatcher and ReplicationZookeeper#add method to create the
+      // peer-state znode. This happens while adding a peer.
+      // The peer state data is set as "ENABLED" by default.
+      ZKUtil.createNodeIfNotExistsAndWatch(zookeeper, peerStateNode,
+        Bytes.toBytes(PeerState.ENABLED.name()));
     }
     this.peerStateTracker = new PeerStateTracker(peerStateNode, zookeeper,
         this);
@@ -154,7 +157,7 @@ public class ReplicationPeer implements Abortable {
 
   @Override
   public void abort(String why, Throwable e) {
-    LOG.warn("The ReplicationPeer coresponding to peer " + clusterKey
+    LOG.fatal("The ReplicationPeer coresponding to peer " + clusterKey
         + " was aborted for the following reason(s):" + why, e);
   }
 

@@ -40,6 +40,7 @@ import org.apache.hadoop.security.token.TokenSelector;
 import org.apache.hadoop.util.ReflectionUtils;
 
 import javax.net.SocketFactory;
+import javax.security.sasl.SaslException;
 import java.io.*;
 import java.net.*;
 import java.security.PrivilegedExceptionAction;
@@ -97,7 +98,7 @@ public class SecureClient extends HBaseClient {
 
       User ticket = remoteId.getTicket();
       Class<?> protocol = remoteId.getProtocol();
-      this.useSasl = User.isSecurityEnabled();
+      this.useSasl = User.isHBaseSecurityEnabled(conf);
       if (useSasl && protocol != null) {
         TokenInfo tokenInfo = protocol.getAnnotation(TokenInfo.class);
         if (tokenInfo != null) {
@@ -185,6 +186,14 @@ public class SecureClient extends HBaseClient {
      * again.
      * The other problem is to do with ticket expiry. To handle that,
      * a relogin is attempted.
+     * <p>
+     * The retry logic is governed by the {@link #shouldAuthenticateOverKrb}
+     * method. In case when the user doesn't have valid credentials, we don't
+     * need to retry (from cache or ticket). In such cases, it is prudent to
+     * throw a runtime exception when we receive a SaslException from the
+     * underlying authentication implementation, so there is no retry from 
+     * other high level (for eg, HCM or HBaseAdmin).
+     * </p>
      */
     private synchronized void handleSaslConnectionFailure(
         final int currRetries,
@@ -222,8 +231,16 @@ public class SecureClient extends HBaseClient {
             LOG.warn("Exception encountered while connecting to " +
                 "the server : " + ex);
           }
-          if (ex instanceof RemoteException)
+          if (ex instanceof RemoteException) {
             throw (RemoteException)ex;
+          }
+          if (ex instanceof SaslException) {
+            String msg = "SASL authentication failed." +
+              " The most likely cause is missing or invalid credentials." +
+              " Consider 'kinit'.";
+            LOG.fatal(msg, ex);
+            throw new RuntimeException(msg, ex);
+          }
           throw new IOException(ex);
         }
       });
@@ -358,10 +375,16 @@ public class SecureClient extends HBaseClient {
           if (LOG.isDebugEnabled()) {
             LOG.debug("call #"+id+", response is:\n"+value.toString());
           }
-          call.setValue(value);
+          // it's possible that this call may have been cleaned up due to a RPC
+          // timeout, so check if it still exists before setting the value.
+          if (call != null) {
+            call.setValue(value);
+          }
         } else if (state == Status.ERROR.state) {
-          call.setException(new RemoteException(WritableUtils.readString(in),
-                                                WritableUtils.readString(in)));
+          if (call != null) {
+            call.setException(new RemoteException(WritableUtils.readString(in), WritableUtils
+                .readString(in)));
+          }
         } else if (state == Status.FATAL.state) {
           // Close the connection
           markClosed(new RemoteException(WritableUtils.readString(in),
@@ -395,9 +418,7 @@ public class SecureClient extends HBaseClient {
       // release the resources
       // first thing to do;take the connection out of the connection list
       synchronized (connections) {
-        if (connections.get(remoteId) == this) {
-          connections.remove(remoteId);
-        }
+        connections.remove(remoteId, this);
       }
 
       // close the streams and therefore the socket
@@ -451,38 +472,12 @@ public class SecureClient extends HBaseClient {
     this(valueClass, conf, NetUtils.getDefaultSocketFactory(conf));
   }
 
+  /**
+   * Creates a SecureConnection. Can be overridden by a subclass for testing.
+   * @param remoteId - the ConnectionId to use for the connection creation.
+   */
   @Override
-  protected SecureConnection getConnection(InetSocketAddress addr,
-                                   Class<? extends VersionedProtocol> protocol,
-                                   User ticket,
-                                   int rpcTimeout,
-                                   Call call)
-                                   throws IOException, InterruptedException {
-    if (!running.get()) {
-      // the client is stopped
-      throw new IOException("The client is stopped");
-    }
-    SecureConnection connection;
-    /* we could avoid this allocation for each RPC by having a
-     * connectionsId object and with set() method. We need to manage the
-     * refs for keys in HashMap properly. For now its ok.
-     */
-    ConnectionId remoteId = new ConnectionId(addr, protocol, ticket, rpcTimeout);
-    do {
-      synchronized (connections) {
-        connection = (SecureConnection)connections.get(remoteId);
-        if (connection == null) {
-          connection = new SecureConnection(remoteId);
-          connections.put(remoteId, connection);
-        }
-      }
-    } while (!connection.addCall(call));
-
-    //we don't invoke the method below inside "synchronized (connections)"
-    //block above. The reason for that is if the server happens to be slow,
-    //it will take longer to establish a connection and that will slow the
-    //entire system down.
-    connection.setupIOstreams();
-    return connection;
+  protected SecureConnection createConnection(ConnectionId remoteId) throws IOException {
+    return new SecureConnection(remoteId);
   }
 }
