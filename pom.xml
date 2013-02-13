@@ -1010,7 +1010,7 @@
     <jetty.jspapi.version>6.1.14</jetty.jspapi.version>
     <jersey.version>1.8</jersey.version>
     <jruby.version>1.6.5</jruby.version>
-    <junit.version>4.10-HBASE-1</junit.version>
+    <junit.version>4.10</junit.version>
     <slf4j.version>1.4.3</slf4j.version>
     <log4j.version>1.2.16</log4j.version>
     <mockito-all.version>1.8.5</mockito-all.version>
@@ -1034,7 +1034,7 @@
     <unittest.include>**/Test*.java</unittest.include>
     <integrationtest.include>**/IntegrationTest*.java</integrationtest.include>
 
-    <surefire.version>2.12-TRUNK-HBASE-2</surefire.version>
+    <surefire.version>2.13</surefire.version>
     <surefire.provider>surefire-junit47</surefire.provider>
 
     <!-- default: run small & medium, medium with 2 threads -->
